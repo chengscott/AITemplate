@@ -44,7 +44,21 @@ def mk_cutlass_lib(template_path, dst_prefix=None):
         fo.write("from . import extra_operation\n")
 
     def process_code(src_path, dst_path, code_set):
-        pattern = re.compile(r"from\s([a-z_0-9]+)\simport \*")
+        # Rewrite intra-package imports to explicit relative imports so that the
+        # generated cutlass_lib package is self-contained and uses these patched
+        # copies rather than any installed `cutlass_library` package.
+        #
+        # cutlass >= 3.2 ships the generator under python/cutlass_library and
+        # guards its imports as:
+        #     try:
+        #       from cutlass_library.library import *
+        #     except ImportError:
+        #       from library import *
+        # Both the `cutlass_library.<mod>` and bare `<mod>` forms (with `import *`
+        # or explicit names) are normalized to `from .<mod> import ...`.
+        pattern = re.compile(
+            r"^(\s*)from\s+(?:cutlass_library\.)?([a-z_0-9]+)\s+import\s+(.*)$"
+        )
         with open(src_path) as fi:
             lines = fi.readlines()
         output = []
@@ -52,9 +66,11 @@ def mk_cutlass_lib(template_path, dst_prefix=None):
         for line in lines:
             match = pattern.match(line)
             if match is not None:
-                name = match.groups()[0]
+                indent, name, rest = match.groups()
                 if name + ".py" in code_set:
-                    line = "from .{name} import *\n".format(name=name)
+                    line = "{indent}from .{name} import {rest}\n".format(
+                        indent=indent, name=name, rest=rest
+                    )
             output.append(line)
         if "library.py" in dst_path:
             lines = extra_enum.emit_library()
@@ -68,7 +84,7 @@ def mk_cutlass_lib(template_path, dst_prefix=None):
         with open(dst_path, "w") as fo:
             fo.writelines(output)
 
-    src_prefix = os.path.join(template_path, "tools/library/scripts")
+    src_prefix = os.path.join(template_path, "python/cutlass_library")
     srcs = os.listdir(src_prefix)
     if "__init__.py" in srcs:
         srcs.remove("__init__.py")
