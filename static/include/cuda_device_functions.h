@@ -85,6 +85,17 @@ inline std::string GetUUIDToString(const char bytes[16]) {
 
 inline std::string PrintDebugDeviceProperties(const DevicePropertyType& prop) {
   std::ostringstream oss;
+  // CUDA 13 removed memoryClockRate/clockRate/memoryBusWidth from
+  // cudaDeviceProp; query them via the device attribute API, which is valid
+  // across CUDA versions.
+  int device = 0;
+  int memoryClockRate = 0;
+  int clockRate = 0;
+  int memoryBusWidth = 0;
+  cudaGetDevice(&device);
+  cudaDeviceGetAttribute(&memoryClockRate, cudaDevAttrMemoryClockRate, device);
+  cudaDeviceGetAttribute(&clockRate, cudaDevAttrClockRate, device);
+  cudaDeviceGetAttribute(&memoryBusWidth, cudaDevAttrGlobalMemoryBusWidth, device);
   oss << "Hardware accelerator device properties: " << "\n  Device: "
       << "\n     ASCII string identifying device: " << prop.name
       << "\n     Major compute capability: " << prop.major
@@ -116,9 +127,9 @@ inline std::string PrintDebugDeviceProperties(const DevicePropertyType& prop) {
       << "\n     The maximum value of cudaAccessPolicyWindow::num_bytes: "
       << prop.accessPolicyMaxWindowSize
       << "\n     Max global memory clock frequency in khz: "
-      << prop.memoryClockRate
+      << memoryClockRate
       << "\n     Peak global memory bandwidth (GByte/s): "
-      << (prop.memoryClockRate / 1e6) * (prop.memoryBusWidth / 8) * 2
+      << (memoryClockRate / 1e6) * (memoryBusWidth / 8) * 2
 
       << "\n  Thread limits: " << "\n     Warp size in threads: "
       << prop.warpSize << "\n     Maximum size of each dimension of a grid: "
@@ -141,7 +152,7 @@ inline std::string PrintDebugDeviceProperties(const DevicePropertyType& prop) {
       << "\n     32-bit registers available per multiprocessor: "
       << prop.regsPerMultiprocessor
       << "\n     Max clock frequency of the multiProcessors in khz: "
-      << prop.clockRate
+      << clockRate
 
       << "\n  Device features: " << "\n     Device has ECC support enabled: "
       << (prop.ECCEnabled ? "yes" : "no")
