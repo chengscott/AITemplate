@@ -16,8 +16,10 @@
 CuTeDSL (FlashAttention-4) backend for the ``flash_attention`` op.
 
 Instead of emitting the vendored FMHA-v1 CUTLASS C++ kernel, this backend:
-1. AOT-compiles FA4's SM80 forward via ``cute.compile()`` + ``export_to_c()``
-   (see ``cutedsl_flash_attention_sm80.FlashAttentionFwdSm80Aot``),
+1. AOT-compiles FA4's forward via ``cute.compile()`` + ``export_to_c()`` --
+   picking FA4's SM80 (Ampere) or SM90 (Hopper) forward by the target arch
+   (see ``cutedsl_flash_attention_sm80.FlashAttentionFwdSm80Aot`` /
+   ``cutedsl_flash_attention_sm90.FlashAttentionFwdSm90Aot``),
 2. produces ``<func>_cutedsl.h`` + ``<func>_cutedsl.o`` (embedded cubin), and
 3. returns a thin C++ wrapper (same AIT signature as the FMHA-v1 backend) that
    slices the packed QKV into strided Q/K/V views and launches the FA4 kernel.
@@ -49,19 +51,30 @@ _LOGGER = logging.getLogger(__name__)
 
 
 # =============================================================================
-# AOT compilation of the FA4 SM80 forward
+# AOT compilation of the FA4 forward (SM80 / SM90)
 # =============================================================================
 
 
-def _aot_compile_cutedsl_kernel(output_dir, func_name, head_dim, is_causal):
-    """AOT-compile FA4 SM80 forward for (head_dim, is_causal); return (.h, .o)."""
+def _aot_compile_cutedsl_kernel(output_dir, func_name, head_dim, is_causal, arch):
+    """AOT-compile the FA4 forward for (head_dim, is_causal, arch); return (.h, .o).
+
+    ``arch`` picks FA4's SM90 (Hopper) forward when >= 90, else the SM80 (Ampere)
+    forward.  Both wrappers export the identical C interface
+    ``(mQ, mK, mV, mO, mLSE, stream)``, so the generated C++ wrapper below is
+    arch-agnostic.
+    """
     import cuda.bindings.driver as cuda_drv
     import cutlass
     import torch
 
-    from aitemplate.backend.cuda.attention.cutedsl_flash_attention_sm80 import (
-        FlashAttentionFwdSm80Aot,
-    )
+    if arch >= 90:
+        from aitemplate.backend.cuda.attention.cutedsl_flash_attention_sm90 import (
+            FlashAttentionFwdSm90Aot as _FlashAttentionFwdAot,
+        )
+    else:
+        from aitemplate.backend.cuda.attention.cutedsl_flash_attention_sm80 import (
+            FlashAttentionFwdSm80Aot as _FlashAttentionFwdAot,
+        )
     from flash_attn.cute.cute_dsl_utils import to_cute_tensor
 
     # Representative dense tensors. batch/seqlen/nheads stay dynamic at runtime
@@ -77,7 +90,7 @@ def _aot_compile_cutedsl_kernel(output_dir, func_name, head_dim, is_causal):
     qt, kt, vt, ot = [to_cute_tensor(t, enable_tvm_ffi=False) for t in (q, k, v, o)]
     lset = to_cute_tensor(lse, assumed_align=4, enable_tvm_ffi=False)
 
-    kernel = FlashAttentionFwdSm80Aot(
+    kernel = _FlashAttentionFwdAot(
         head_dim=d,
         softmax_scale=head_dim ** (-0.5),
         is_causal=is_causal,
@@ -87,7 +100,7 @@ def _aot_compile_cutedsl_kernel(output_dir, func_name, head_dim, is_causal):
 
     _LOGGER.info(
         f"CuTeDSL/FA4: AOT compiling flash_attention forward for {func_name} "
-        f"(head_dim={d}, causal={is_causal})"
+        f"(head_dim={d}, causal={is_causal}, SM{arch})"
     )
     import cutlass.cute as cute
 
@@ -235,6 +248,7 @@ def flash_attention_gen_function_cutedsl(func_attrs: Dict[str, Any]) -> str:
         func_name=func_name,
         head_dim=head_dim,
         is_causal=is_causal,
+        arch=arch,
     )
     func_attrs["cutedsl_obj_path"] = o_path
 

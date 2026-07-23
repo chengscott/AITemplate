@@ -1,0 +1,7 @@
+Device: NVIDIA H200  sm90  (FA4 CuTeDSL backend embedded in AITemplate .so)
+chk_b2_h8_s512_d64_f         seq_len(padded)=512   aligned=True  rel_vs_fp32=4.26e-04  rel_vs_pip_FA4=0.00e+00  OK
+chk_b2_h8_s512_d64_c         seq_len(padded)=512   aligned=True  rel_vs_fp32=2.66e-04  rel_vs_pip_FA4=0.00e+00  OK
+chk_b3_h12_s1024_d128_f      seq_len(padded)=1024  aligned=True  rel_vs_fp32=4.79e-04  rel_vs_pip_FA4=0.00e+00  OK
+chk_b3_h12_s1024_d128_c      seq_len(padded)=1024  aligned=True  rel_vs_fp32=5.92e-04  rel_vs_pip_FA4=0.00e+00  OK
+chk_b2_h4_s256_d32_f         seq_len(padded)=256   aligned=True  rel_vs_fp32=3.05e-04  rel_vs_pip_FA4=0.00e+00  OK
+chk_b2_h8_s300_d64_f         seq_len(padded)=512   aligned=False rel_vs_fp32=5.20e-04  rel_vs_pip_FA4=0.00e+00  OK

@@ -115,10 +115,14 @@ inline std::string PrintDebugDeviceProperties(const DevicePropertyType& prop) {
       << prop.sharedMemPerMultiprocessor
       << "\n     The maximum value of cudaAccessPolicyWindow::num_bytes: "
       << prop.accessPolicyMaxWindowSize
+#if !defined(CUDART_VERSION) || CUDART_VERSION < 13000
+      // memoryClockRate / memoryBusWidth were removed from cudaDeviceProp in
+      // CUDA 13 (query via cudaDeviceGetAttribute instead).
       << "\n     Max global memory clock frequency in khz: "
       << prop.memoryClockRate
       << "\n     Peak global memory bandwidth (GByte/s): "
       << (prop.memoryClockRate / 1e6) * (prop.memoryBusWidth / 8) * 2
+#endif
 
       << "\n  Thread limits: " << "\n     Warp size in threads: "
       << prop.warpSize << "\n     Maximum size of each dimension of a grid: "
@@ -140,8 +144,12 @@ inline std::string PrintDebugDeviceProperties(const DevicePropertyType& prop) {
       << "\n     32-bit registers available per block: " << prop.regsPerBlock
       << "\n     32-bit registers available per multiprocessor: "
       << prop.regsPerMultiprocessor
+#if !defined(CUDART_VERSION) || CUDART_VERSION < 13000
+      // clockRate was removed from cudaDeviceProp in CUDA 13
+      // (query via cudaDeviceGetAttribute instead).
       << "\n     Max clock frequency of the multiProcessors in khz: "
       << prop.clockRate
+#endif
 
       << "\n  Device features: " << "\n     Device has ECC support enabled: "
       << (prop.ECCEnabled ? "yes" : "no")

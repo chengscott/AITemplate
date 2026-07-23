@@ -15,8 +15,9 @@
 """Compare the two flash_attention backends BOTH embedded in AITemplate .so files:
 
   * FMHA v1  — the vendored 2022 CUTLASS C++ kernel (use_cutedsl_attention=False)
-  * FA4      — FlashAttention-4 SM80 forward, AOT-compiled CuTeDSL linked into the
-               model .so (use_cutedsl_attention=True)
+  * FA4      — FlashAttention-4 forward (SM80 on Ampere / SM90 on Hopper, picked
+               by the detected arch), AOT-compiled CuTeDSL linked into the model
+               .so (use_cutedsl_attention=True)
 
 Same op (`ops.flash_attention`), same packed-QKV inputs, same AIT runtime timing
 (`benchmark_with_tensors`) — an apples-to-apples in-generated-code comparison.

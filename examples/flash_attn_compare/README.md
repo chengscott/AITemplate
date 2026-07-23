@@ -1,4 +1,4 @@
-# FlashAttention-4 vs current AITemplate FMHA (v1) — A100
+# FlashAttention-4 vs current AITemplate FMHA (v1) — A100 (sm80) & H200 (sm90)
 
 Ports the **latest** FlashAttention (FA4, CuTeDSL) into the repo and benchmarks
 its forward pass against the **current** vendored attention op (FMHA v1, the
@@ -11,7 +11,13 @@ its forward pass against the **current** vendored attention op (FMHA v1, the
 | Source | `python/aitemplate/backend/cuda/attention/src/` (FMHA v1, 2022) | `flash_attn/cute/` @ flash-attn 2.8.4 (`b54df16`) |
 | Impl | C++/CUDA emitted by AITemplate → nvcc | pure-Python CuTeDSL, JIT-compiled |
 | SM80 kernel | `run_fmha_fp16_sm80` | `FlashAttentionForwardSm80` (`flash_fwd.py`) |
+| SM90 kernel | `run_fmha_fp16_sm80` (no Hopper path) | `FlashAttentionForwardSm90` (`flash_fwd.py`) |
 | Obtained via | already vendored in repo | `pip install flash-attn-4` (pure Python, no build) |
+
+The FA4 backend picks the SM80 (Ampere) or SM90 (Hopper) forward automatically
+from the target arch (`Target._arch`) — no flag needed. Everything below was
+first validated on A100/sm80; the same op + scripts run unchanged on H200/sm90
+(see "Hopper / SM90" below).
 
 FA4 is used straight from the installed `flash-attn-4` package (no source is
 vendored into this repo — see "Environments" below).
@@ -115,8 +121,12 @@ runtime `.so` is self-contained (no Python).
 Files added for the backend:
 - `python/aitemplate/backend/cuda/attention/cutedsl_flash_attention_sm80.py` — thin
   `@cute.jit` entry wrapping FA4's SM80 forward for clean AOT export.
+- `python/aitemplate/backend/cuda/attention/cutedsl_flash_attention_sm90.py` — the
+  Hopper counterpart, wrapping FA4's `FlashAttentionForwardSm90` (warp-specialized
+  TMA + WGMMA) with the same exported C interface.
 - `python/aitemplate/backend/cuda/attention/flash_attention_cutedsl.py` — AOT compile
-  + C++ wrapper + `cuda.flash_attention.*_cutedsl` registry functions.
+  (arch-dispatched SM80/SM90) + C++ wrapper + `cuda.flash_attention.*_cutedsl`
+  registry functions.
 - dispatch in `python/aitemplate/compiler/ops/attention/flash_attention.py`
   (`use_cutedsl_attention`).
 
@@ -181,6 +191,92 @@ read as `(batch, seq_len, 3, nheads, head_dim)`); `head_dim` and `causal` are
 baked in at AOT time; requires the py3.10 build env (only at build time — the
 resulting `.so` needs no Python). The build must run on the `port-cutlass-v4`
 branch (CUTLASS 4.6.1) with `flash-attn-4` + `nvidia-cutlass-dsl` installed.
+
+## Hopper / SM90 (H200, A100 = SM80)
+
+The backend AOT-compiles FA4's **`FlashAttentionForwardSm90`** (warp-specialized
+TMA + WGMMA) when the target reports `arch >= 90`, and its **`...Sm80`** forward
+otherwise — chosen from `Target._arch`, no extra flag. The exported C interface
+(`cute_dsl_<name>_wrapper(module, mQ, mK, mV, mO, mLSE, stream)`) and the
+generated C++ wrapper are identical across archs, so the packed-QKV slicing,
+the `.o`/`.h` link wiring, and the whole op contract are unchanged.
+
+Because the two example scripts detect the arch via `detect_target()`, testing
+SM90 needs **no code change** — run the exact same commands on a Hopper box:
+
+```bash
+# Correctness: FA4-in-AIT vs fp32 ref AND vs pip flash_attn_func (identical kernel)
+PYTHONPATH=$(pwd)/python CUDA_HOME=/usr/local/cuda \
+  <py3.10-fa4-env>/bin/python \
+  examples/flash_attn_compare/correctness_check.py ./tmp_chk_sm90
+
+# Apples-to-apples in-.so benchmark, FMHA-v1 vs FA4, both via compile_model
+PYTHONPATH=$(pwd)/python CUDA_HOME=/usr/local/cuda \
+  <py3.10-fa4-env>/bin/python \
+  examples/flash_attn_compare/bench_ait_v1_vs_fa4.py --workdir ./tmp_cmp_sm90
+```
+
+Each script prints the detected `smXX` in its header, so you can confirm the
+Hopper path is exercised. The SM90 config is not hand-picked: tile sizes and the
+`mma_pv_is_rs` / `intra_wg_overlap` flags come from FA4's own
+`interface._tile_size_fwd_sm90` (e.g. `192×128` for head_dim 64, `128×128` for
+head_dim 128), and `num_stages=2` / `num_threads=384` (1 producer + 2 MMA
+warpgroups) mirror FA4's `arch // 10 == 9` dispatch — so the embedded kernel is
+**bit-identical** to what `flash_attn_func` launches on Hopper. See
+`cutedsl_flash_attention_sm90.py`.
+
+### Correctness (H200 80GB, sm90)
+
+`correctness_check.py` — FA4 embedded in the AIT `.so`, vs fp32 einsum ref and
+vs pip `flash_attn_func` (the identical kernel). **Bit-exact vs pip FA4**
+(`rel_vs_pip_FA4 = 0.0`) and ~3–6e-4 vs fp32 across head_dim ∈ {32, 64, 128},
+causal + non-causal, aligned and non-256-aligned seqlens (raw:
+`results/correctness_h200.txt`):
+
+```
+chk_b2_h8_s512_d64_f     rel_vs_fp32=4.26e-04  rel_vs_pip_FA4=0.00e+00  OK
+chk_b2_h8_s512_d64_c     rel_vs_fp32=2.66e-04  rel_vs_pip_FA4=0.00e+00  OK
+chk_b3_h12_s1024_d128_f  rel_vs_fp32=4.79e-04  rel_vs_pip_FA4=0.00e+00  OK
+chk_b3_h12_s1024_d128_c  rel_vs_fp32=5.92e-04  rel_vs_pip_FA4=0.00e+00  OK
+chk_b2_h4_s256_d32_f     rel_vs_fp32=3.05e-04  rel_vs_pip_FA4=0.00e+00  OK
+chk_b2_h8_s300_d64_f     rel_vs_fp32=5.20e-04  rel_vs_pip_FA4=0.00e+00  OK   (non-256-aligned)
+```
+
+### In-generated-code results (H200 80GB, fp16, both via `compile_model`)
+
+`speedup = v1_ms / FA4_ms`. Every shape numerically correct vs fp32 ref (`VF`).
+Raw: `results/ait_v1_vs_fa4_h200.txt`, `results/fa4_h200.json`.
+
+```
+shape                             v1 ms   FA4 ms  speedup  v1 TF/s FA4 TF/s
+b16_h16_s512_d64_full             0.108    0.061    1.79x    158.5    283.3
+b16_h16_s1024_d64_full            0.441    0.176    2.51x    155.9    391.5
+b8_h16_s2048_d64_full             1.523    0.281    5.42x     90.3    489.7
+b4_h16_s4096_d64_full             6.091    0.526   11.57x     45.1    522.2
+b16_h16_s512_d128_full            0.289    0.081    3.58x    118.9    425.1
+b16_h16_s1024_d128_full           1.166    0.238    4.89x    117.9    576.5
+b8_h16_s2048_d128_full            3.892    0.428    9.09x     70.6    641.8
+b4_h16_s4096_d128_full           15.694    0.821   19.12x     35.0    669.8
+b16_h16_s512_d64_causal           0.084    0.056    1.51x    101.9    154.0
+b16_h16_s1024_d64_causal          0.258    0.145    1.78x    133.2    236.7
+b8_h16_s2048_d64_causal           0.712    0.200    3.56x     96.5    343.0
+b4_h16_s4096_d64_causal           2.552    0.341    7.47x     53.9    402.6
+b16_h16_s512_d128_causal          0.220    0.070    3.16x     78.0    246.2
+b16_h16_s1024_d128_causal         0.703    0.172    4.08x     97.8    399.1
+b8_h16_s2048_d128_causal          2.049    0.264    7.76x     67.1    520.4
+b4_h16_s4096_d128_causal          7.701    0.457   16.84x     35.7    601.2
+```
+
+**FA4-in-AITemplate is 1.5×–19.1× faster than the vendored FMHA v1 on Hopper**,
+holding ~520–670 TFLOP/s dense (up to ~600 causal) while v1 collapses to
+~35–160 TFLOP/s. The gap widens with head_dim=128 and long sequences, same as on
+A100 but more extreme (v1's `o_tmp` looping path scales especially poorly here).
+
+> Toolchain note: this run used CUDA 13.0 / driver 580 with torch 2.7.0+cu126.
+> CUDA 13 removed `cudaDeviceProp::{clockRate,memoryClockRate,memoryBusWidth}`,
+> so `static/include/cuda_device_functions.h` guards those fields behind
+> `CUDART_VERSION < 13000` (they're only used for a human-readable device dump).
+> `H200` was also added to `detect_target`'s sm90 name list.
 
 ## Caveats
 
