@@ -1,0 +1,19 @@
+Device: NVIDIA A100 80GB PCIe  sm80  torch 2.7.0+cu126
+shape                             v1 ms   FA4 ms  speedup  v1 TF/s FA4 TF/s    ok
+b16_h16_s512_d64_full             0.235    0.112    2.09x     73.0    153.0    VF
+b16_h16_s1024_d64_full            0.980    0.384    2.55x     70.2    179.0    VF
+b8_h16_s2048_d64_full             2.377    0.760    3.13x     57.8    180.8    VF
+b4_h16_s4096_d64_full             8.354    1.556    5.37x     32.9    176.6    VF
+b16_h16_s512_d128_full            0.772    0.194    3.97x     44.5    176.9    VF
+b16_h16_s1024_d128_full           3.105    0.723    4.30x     44.3    190.2    VF
+b8_h16_s2048_d128_full            6.318    1.433    4.41x     43.5    191.8    VF
+b4_h16_s4096_d128_full           19.635    2.862    6.86x     28.0    192.1    VF
+b16_h16_s512_d64_causal           0.185    0.089    2.07x     46.5     96.4    VF
+b16_h16_s1024_d64_causal          0.586    0.262    2.24x     58.6    131.1    VF
+b8_h16_s2048_d64_causal           1.202    0.483    2.49x     57.2    142.2    VF
+b4_h16_s4096_d64_causal           3.503    0.944    3.71x     39.2    145.6    VF
+b16_h16_s512_d128_causal          0.560    0.166    3.38x     30.7    103.7    VF
+b16_h16_s1024_d128_causal         1.872    0.518    3.61x     36.7    132.7    VF
+b8_h16_s2048_d128_causal          3.501    0.953    3.67x     39.3    144.3    VF
+b4_h16_s4096_d128_causal         10.090    1.829    5.52x     27.2    150.3    VF
+speedup = v1_ms / FA4_ms (>1 => FA4 faster). ok: V/F correct vs fp32 ref

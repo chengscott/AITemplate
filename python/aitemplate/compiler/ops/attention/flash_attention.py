@@ -186,11 +186,22 @@ class flash_attention(Operator):
             key = self._gen_exec_key(x_shape)
             self._attrs["exec_path"][key] = ""
 
+    def _use_cutedsl(self) -> bool:
+        """Whether to use the FA4 CuTeDSL backend instead of the FMHA-v1 C++ one."""
+        current_target = backend.target.Target.current()
+        return current_target._kwargs.get("use_cutedsl_attention", False)
+
+    def _backend_suffix(self) -> str:
+        return "_cutedsl" if self._use_cutedsl() else ""
+
     def gen_function(self) -> str:
         """call backend functions"""
         target = backend.target.Target.current()
-        func_key = "{target}.{op}.gen_function".format(
-            target=target.name(), op=self._attrs["op"]
+        suffix = self._backend_suffix()
+        # codegen.py reads backend_suffix to pick the matching func_decl/func_call.
+        self._attrs["backend_suffix"] = suffix
+        func_key = "{target}.{op}.gen_function{suffix}".format(
+            target=target.name(), op=self._attrs["op"], suffix=suffix
         )
         func = registry.get(func_key)
         return func(self._attrs)

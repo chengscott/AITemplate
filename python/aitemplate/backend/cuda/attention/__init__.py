@@ -16,6 +16,10 @@
 cuda flash_attention module init
 """
 
-from aitemplate.backend.cuda.attention import flash_attention, mem_eff_attention
+from aitemplate.backend.cuda.attention import (
+    flash_attention,
+    flash_attention_cutedsl,
+    mem_eff_attention,
+)
 
-__all__ = ["flash_attention", "mem_eff_attention"]
+__all__ = ["flash_attention", "flash_attention_cutedsl", "mem_eff_attention"]
