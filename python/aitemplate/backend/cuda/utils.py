@@ -18,6 +18,8 @@ Util functions for CUDA codegen.
 
 import logging
 
+from collections import OrderedDict
+
 from aitemplate.backend import registry
 from aitemplate.utils.mk_cutlass_lib.mk_cutlass_lib import mk_cutlass_lib
 
@@ -36,6 +38,9 @@ class Args:
         self.architectures = arch
         self.kernels = "all"
         self.ignore_kernels = ""
+        # cutlass >= 3.2 Manifest reads these additional fields
+        self.exclude_kernels = ""
+        self.instantiation_level = ""
         self.cuda_version = "11.4.0"
         self.kernel_filter_file = None
         self.selected_kernel_list = None
@@ -85,4 +90,29 @@ def gen_ops(
         except AttributeError:
             _LOGGER.warning("Arch " + arch + " is not supported by extra ops.")
 
-    return manifest.operations
+    return _flatten_operations(manifest.operations)
+
+
+def _flatten_operations(operations):
+    """Normalize the cutlass manifest operations layout.
+
+    cutlass >= 3.2 nests operations by minimum compute capability:
+        operations[kind][min_cc][configuration_name] -> [Operation, ...]
+    while the AITemplate op extractors expect the historical layout:
+        operations[kind][configuration_name] -> [Operation, ...]
+
+    Collapse the min_cc level (merging across compute capabilities) so the
+    downstream extractors keep working regardless of the cutlass version.
+    """
+    flattened = {}
+    for kind, level1 in operations.items():
+        values = list(level1.values())
+        if values and all(isinstance(v, dict) for v in values):
+            merged = OrderedDict()
+            for _min_cc, configs in level1.items():
+                for config_name, ops in configs.items():
+                    merged.setdefault(config_name, []).extend(ops)
+            flattened[kind] = merged
+        else:
+            flattened[kind] = level1
+    return flattened

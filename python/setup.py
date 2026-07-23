@@ -91,7 +91,7 @@ def gen_cutlass_list():
 
 
 def gen_cutlass_lib_list():
-    srcs = ["aitemplate/3rdparty/cutlass/tools/library/scripts"]
+    srcs = ["aitemplate/3rdparty/cutlass/python/cutlass_library"]
     f_cond = lambda x: True
     return gen_file_list(srcs, f_cond)
 
