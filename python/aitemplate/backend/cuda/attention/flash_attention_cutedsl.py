@@ -282,11 +282,29 @@ def flash_attention_gen_function_call_cutedsl(func_attrs, indent="  "):
         name=func_attrs["inputs"][1]._attrs["name"]
     )
 
-    batch_size = func_attrs["batch_size"]
+    batch_size = func_attrs["batch_size"]  # static max, for workspace/LSE sizing
     seq_len = func_attrs["max_seq_len"]  # actual length (not the 256-padded one)
-    num_heads = x._attrs["shape"][2]._attrs["values"][0]
-    head_size = x._attrs["shape"][3]._attrs["values"][0]
+    xshape = x._attrs["shape"]
+    dense5d = len(xshape) == 5  # [B,S,3,H,D] vs packed 4D [total,3,H,D]
+    num_heads = xshape[3 if dense5d else 2]._attrs["values"][0]
+    head_size = xshape[4 if dense5d else 3]._attrs["values"][0]
     softmax_scale = head_size ** (-0.5)
+
+    # Runtime batch for the kernel grid. Passing the baked max makes the kernel
+    # process batch_size batches and write past the (runtime-sized) output for any
+    # runtime B < batch_size, so a DYNAMIC batch must use the runtime dim variable.
+    # 5D: dim0 IS B, use it directly. 4D packed: dim0 = total = B*seq_len, so
+    # B = total / seq_len (exact). Workspace/LSE below keep the constant max, so
+    # they never underflow at smaller runtime batch.
+    dim0 = xshape[0]
+    if len(dim0._attrs["values"]) > 1:  # dynamic batch
+        batch_arg = (
+            dim0._attrs["name"]
+            if dense5d
+            else "({} / {})".format(dim0._attrs["name"], seq_len)
+        )
+    else:
+        batch_arg = str(dim0._attrs["values"][0] if dense5d else batch_size)
 
     return _v1.FUNC_CALL_TEMPLATE.render(
         func_name=func_attrs["name"],
@@ -297,7 +315,7 @@ def flash_attention_gen_function_call_cutedsl(func_attrs, indent="  "):
         o_tmp="reinterpret_cast<float*>(global_workspace_ + {} * sizeof(float))".format(
             batch_size * num_heads * func_attrs["seq_len"]
         ),
-        batch_size=batch_size,
+        batch_size=batch_arg,
         seq_len=seq_len,
         num_heads=num_heads,
         head_size=head_size,

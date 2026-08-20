@@ -85,6 +85,11 @@ class FlashAttentionFwdSm80Aot:
         mLSE: cute.Tensor,
         stream: cuda.CUstream,
     ):
+        # All the optional varlen/paging/masking/aux tensors default to None /
+        # AuxData(). Upstream flash-attn added mCuTotalMBlocks + mCuTotalSplitsMBlocks
+        # positionally BEFORE `stream`, so passing stream positionally here landed it
+        # on mCuTotalMBlocks and left the real stream = None (-> a None operand in
+        # cuda.launch_cfg.create). Pass stream as a keyword to be robust to that.
         self.fa(
             mQ,
             mK,
@@ -92,15 +97,5 @@ class FlashAttentionFwdSm80Aot:
             mO,
             mLSE,
             self.softmax_scale,
-            None,  # cu_seqlens_q
-            None,  # cu_seqlens_k
-            None,  # seqused_q
-            None,  # seqused_k
-            None,  # page_table
-            None,  # window_size_left
-            None,  # window_size_right
-            None,  # learnable_sink
-            None,  # blocksparse_tensors
-            AuxData(),  # aux_data (compile-time constant)
-            stream,
+            stream=stream,
         )
