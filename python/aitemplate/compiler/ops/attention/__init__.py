@@ -18,6 +18,7 @@ flash attention module init
 
 from aitemplate.compiler.ops.attention.flash_attention import flash_attention
 from aitemplate.compiler.ops.attention.mem_eff_attention import mem_eff_attention
+from aitemplate.compiler.ops.attention.nvte_fused_attn import nvte_fused_attn
 
 
-__all__ = ["flash_attention", "mem_eff_attention"]
+__all__ = ["flash_attention", "mem_eff_attention", "nvte_fused_attn"]

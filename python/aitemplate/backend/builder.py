@@ -463,6 +463,27 @@ clean_constants:
         if has_cutedsl:
             build_so_cmd += " -lcuda"
 
+        # Add TransformerEngine libs when an nvte_* op object is present (the op's
+        # generated .cu calls libtransformer_engine's nvte_cublas_gemm etc.).
+        if "nvte_" in obj_files:
+            nvte_dir = os.environ.get("NVTE_LIB_DIR", "")
+            if not nvte_dir:
+                # find_spec locates the pkg (holds libtransformer_engine.so) without
+                # importing TE.
+                import importlib.util
+
+                _spec = importlib.util.find_spec("transformer_engine")
+                nvte_dir = (
+                    _spec.submodule_search_locations[0]
+                    if _spec and _spec.submodule_search_locations
+                    else ""
+                )
+            # link is via `nvcc -shared`; rpath must go through -Xlinker (not -Wl,).
+            build_so_cmd += (
+                f" -L{nvte_dir} -Xlinker -rpath -Xlinker {nvte_dir}"
+                " -ltransformer_engine -lcublasLt -lcublas -lnvrtc -lcuda -lcudart"
+            )
+
         cc = Target.current().cc()
         compile_options = Target.current().compile_options()
 

@@ -1,0 +1,56 @@
+#  TransformerEngine cuBLAS/FP8 GEMM as an AITemplate custom op.
+#
+#  Y = X @ W^T  via nvte_cublas_gemm from libtransformer_engine (the same C kernel
+#  te.Linear calls). X: [..., K], W: [N, K] -> Y: [..., N]. fp16 today; the FP8 path
+#  (amax/scale/scale_inv + FP8 dtype) is a config extension for SM90+ (H200).
+#
+#  Modeled on the flash_attention external-kernel op. See nvte_gemm backend codegen
+#  (backend/cuda/gemm_universal/nvte_gemm.py) for the emitted C++.
+from aitemplate import backend
+from aitemplate.backend import registry
+from aitemplate.compiler.base import Operator, Tensor
+
+# pylint: disable=C0103,W0221,W0223
+
+# cuBLASLt workspace (bytes). 32MB is the size TE's PyTorch path uses on Hopper.
+_WORKSPACE_BYTES = 32 * 1024 * 1024
+
+
+class nvte_gemm(Operator):
+    """Y = X @ W^T using TransformerEngine's nvte_cublas_gemm."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._attrs["op"] = "nvte_gemm"
+        self._attrs["has_profiler"] = False
+        self._attrs["workspace"] = _WORKSPACE_BYTES
+
+    def _infer_shapes(self, x: Tensor, w: Tensor):
+        x_shape = x._attrs["shape"]
+        w_shape = w._attrs["shape"]
+        assert len(w_shape) == 2, "nvte_gemm weight must be 2D [N, K]"
+        # contraction dim K must match (last dim of x, last dim of w)
+        assert (
+            x_shape[-1]._attrs["values"] == w_shape[1]._attrs["values"]
+        ), "nvte_gemm: X last dim (K) must match W dim1 (K)"
+        return list(x_shape[:-1]) + [w_shape[0]]
+
+    def __call__(self, x: Tensor, w: Tensor) -> Tensor:
+        """x: [..., K] activations, w: [N, K] weight. Returns [..., N]."""
+        self._attrs["inputs"] = [x, w]
+        self._set_depth()
+        output = Tensor(
+            self._infer_shapes(x, w), src_ops={self}, dtype=x._attrs["dtype"]
+        )
+        self._attrs["outputs"] = [output]
+        return output
+
+    def _get_op_attributes(self):
+        return {}
+
+    def gen_function(self) -> str:
+        target = backend.target.Target.current()
+        func_key = "{target}.{op}.gen_function".format(
+            target=target.name(), op=self._attrs["op"]
+        )
+        return registry.get(func_key)(self._attrs)

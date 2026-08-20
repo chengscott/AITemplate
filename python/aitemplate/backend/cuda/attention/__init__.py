@@ -20,6 +20,12 @@ from aitemplate.backend.cuda.attention import (
     flash_attention,
     flash_attention_cutedsl,
     mem_eff_attention,
+    nvte_fused_attn,
 )
 
-__all__ = ["flash_attention", "flash_attention_cutedsl", "mem_eff_attention"]
+__all__ = [
+    "flash_attention",
+    "flash_attention_cutedsl",
+    "mem_eff_attention",
+    "nvte_fused_attn",
+]

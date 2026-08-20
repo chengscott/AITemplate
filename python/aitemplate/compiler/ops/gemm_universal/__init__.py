@@ -93,6 +93,8 @@ from aitemplate.compiler.ops.gemm_universal.gemm_rrr_bias_permute import (
     gemm_rrr_bias_permute,
 )
 from aitemplate.compiler.ops.gemm_universal.gemm_rrr_permute import gemm_rrr_permute
+from aitemplate.compiler.ops.gemm_universal.nvte_gemm import nvte_gemm
+from aitemplate.compiler.ops.gemm_universal.nvte_rmsnorm import nvte_rmsnorm
 from aitemplate.compiler.ops.gemm_universal.group_gemm_rcr import group_gemm_rcr
 from aitemplate.compiler.ops.gemm_universal.group_gemm_rcr_bias import (
     group_gemm_rcr_bias,
