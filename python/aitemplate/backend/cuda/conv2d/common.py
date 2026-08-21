@@ -467,6 +467,402 @@ FUNC_CALL_TEMPLATE = jinja2.Template(
 )
 
 
+# ---------------------------------------------------------------------------
+# CUTLASS API 3.x (SM90 / Hopper) native convolution host codegen. ("API 3.x/2.x"
+# = the CUTLASS programming-model generation, not the release -- vendored is 4.7.)
+#
+# AIT's default conv host path (templates above) is 100% CUTLASS API 2.x: it wraps
+# the kernel in cutlass::conv::device::ImplicitGemmConvolution and builds the
+# SM80 positional Arguments. The templates below are a parallel host path for
+# ConvOperation3x (is_3x=True) ops: a ConvUniversalAdapter<ConvUniversal<...>>
+# with a hand-authored fusion epilogue (bias / bias+relu / bias+add+relu),
+# mirroring test/unit/conv/device_3x/testbed_conv.hpp and
+# examples/76_blackwell_conv. Gated entirely on op.is_3x so the 2.x (FORCE=0)
+# path is byte-identical.
+# ---------------------------------------------------------------------------
+
+# EmitConv3xInstance (3rdparty conv3x_emitter.py) leaves the epilogue
+# CollectiveBuilder's fusion (15th) template arg defaulted to a plain
+# LinearCombination -- so it can never thread bias/residual/relu. This template
+# is that emitter's output with ${fusion_op} injected as the fusion arg.
+INSTANCE_TEMPLATE_3X_STR = """
+
+// CUTLASS >= 3 convolution ${conv_kind_name} kernel instance "${operation_name}"
+using ${operation_name}_epilogue =
+  typename cutlass::epilogue::collective::CollectiveBuilder<
+    ${arch},
+    ${opcode_class_epi},
+    ${mma_tile_shape},               // mma tile shape
+    ${cluster_shape},                // cluster shape
+    ${epi_tile_mn},
+    ${element_accumulator},
+    ${element_compute},
+    ${element_c}, ${layout_c}, 128 / cute::sizeof_bits_v<${element_c}>,
+    ${element_d}, ${layout_d}, 128 / cute::sizeof_bits_v<${element_d}>,
+    ${epilogue_schedule},
+    ${fusion_op}
+  >::CollectiveOp;
+
+using ${operation_name}_mainloop =
+  typename cutlass::conv::collective::CollectiveBuilder<
+    ${arch},
+    ${opcode_class_main},
+    ${conv_kind},         // kFprop, kDgrad, or kWgrad
+    ${element_a}, ${layout_a}, 128 / cute::sizeof_bits_v<${element_a}>,
+    ${element_b}, ${layout_b}, 128 / cute::sizeof_bits_v<${element_b}>,
+    ${element_accumulator},
+    ${mma_tile_shape},        // mma tile shape
+    ${cluster_shape},         // cluster shape
+    ${stages},
+    ${kernel_schedule}
+  >::CollectiveOp;
+
+using ${operation_name}_problem_shape = cutlass::conv::ConvProblemShape<${conv_kind}, ${operation_name}_mainloop::NumSpatialDimensions>;
+
+using ${operation_name}_base = cutlass::conv::kernel::ConvUniversal<
+    ${operation_name}_problem_shape,
+    ${operation_name}_mainloop,
+    ${operation_name}_epilogue,
+    ${tile_scheduler}
+  >;
+"""
+
+INSTANCE_TEMPLATE_3X = jinja2.Template(
+    """
+{{config}}
+using {{name}} = cutlass::conv::device::ConvUniversalAdapter<{{config_name}}>;
+"""
+)
+
+SRC_TEMPLATE_3X = jinja2.Template(
+    """
+#include <cstdio>
+#include <stdexcept>
+
+#include "cutlass/cutlass.h"
+#include "cute/tensor.hpp"
+#include "cutlass/numeric_types.h"
+#include "cutlass/conv/convnd_problem_shape.hpp"
+#include "cutlass/conv/device/conv_universal_adapter.hpp"
+#include "cutlass/conv/kernel/conv_universal.hpp"
+#include "cutlass/conv/collective/collective_builder.hpp"
+#include "cutlass/epilogue/collective/collective_builder.hpp"
+#include "cutlass/epilogue/fusion/operations.hpp"
+#include "cutlass/epilogue/thread/activation.h"
+#include "cutlass/util/host_tensor.h"
+#include "cutlass/util/device_memory.h"
+
+{{extra_header}}
+
+#define CUTLASS_CHECK(status)                                                         \\
+  {                                                                                   \\
+    cutlass::Status error = status;                                                   \\
+    if (error != cutlass::Status::kSuccess) {                                         \\
+      static char msg[2048];                                                          \\
+      snprintf(msg, sizeof(msg), "[%s] Got cutlass error: %s at: %s",                 \\
+        __FILE__, cutlassGetStatusString(error), __LINE__);                           \\
+      fprintf(stderr, msg);                                                           \\
+      throw std::runtime_error(msg);                                                  \\
+    }                                                                                 \\
+  }
+
+{{instances}}
+
+{{functions}}
+"""
+)
+
+FUNCTION_TEMPLATE_3X = jinja2.Template(
+    """
+void {{function_name}} (
+    void* in_ptr,
+    void* weight_ptr,
+    void* out_ptr,
+{% if is_bias %}
+    void* bias_ptr,
+{% elif is_bias_add %}
+    void* bias_ptr,
+    void* res_ptr,
+{% endif %}
+    uint8_t* workspace,
+    int64_t* batch,
+    int64_t* out_ch,
+    int64_t* in_ch,
+    int64_t* kernel_h,
+    int64_t* kernel_w,
+    int64_t* in_h,
+    int64_t* in_w,
+    int64_t* out_batch,
+    int64_t* out_h,
+    int64_t* out_w,
+    int strideh,
+    int dilationh,
+    int padh,
+    int stridew,
+    int dilationw,
+    int padw,
+    cudaStream_t stream
+  ) {
+
+  {{shape_function}}
+
+  int i32_batch = *batch;
+  int i32_in_h = *in_h;
+  int i32_in_w = *in_w;
+  int i32_in_ch = *in_ch;
+  int i32_out_ch = *out_ch;
+  int i32_kernel_h = *kernel_h;
+  int i32_kernel_w = *kernel_w;
+  int i32_out_batch = *out_batch;
+  int i32_out_h = *out_h;
+  int i32_out_w = *out_w;
+  (void)i32_out_batch; (void)i32_out_h; (void)i32_out_w;
+
+  using ConvProblemShape3x = cutlass::conv::ConvProblemShape<cutlass::conv::Operator::kFprop, 2>;
+  ConvProblemShape3x problem_shape(
+    cutlass::conv::Mode::kCrossCorrelation,
+    {i32_batch, i32_in_h, i32_in_w, i32_in_ch},           // [n, h, w, c]
+    {i32_out_ch, i32_kernel_h, i32_kernel_w, i32_in_ch},  // [k, r, s, c]
+    {padh, padw},                                         // lower padding [pad_h, pad_w]
+    {padh, padw},                                         // upper padding [pad_h, pad_w]
+    {strideh, stridew},                                   // traversal stride [stride_h, stride_w]
+    {dilationh, dilationw},                               // dilation [dilation_h, dilation_w]
+    1                                                     // groups
+  );
+
+  {{exec_paths}}
+
+  throw std::runtime_error(
+    "Unsupported workload for this conv2d specialization."
+  );
+}
+"""
+)
+
+# EpilogueArguments: {fusion_thread_args, ptr_C, stride_C, ptr_D, stride_D}.
+# StrideC/StrideD for fprop are derived from problem_shape.stride_C exactly as
+# testbed_conv.hpp does. The fusion callback args (alpha/beta/bias_ptr) are set
+# by name after aggregate-init so we never depend on brace field order.
+EXEC_TEMPLATE_3X = jinja2.Template(
+    """
+{{indent}}using {{instance_name}}_StrideC = typename {{instance_name}}::ConvKernel::StrideC;
+{{indent}}using {{instance_name}}_StrideD = typename {{instance_name}}::ConvKernel::StrideD;
+{{indent}}{{instance_name}}_StrideC stride_C{};
+{{indent}}{{instance_name}}_StrideD stride_D{};
+{{indent}}cute::for_each(cute::make_seq<cute::rank<0>({{instance_name}}_StrideC{})>{}, [&](auto i) {
+{{indent}}  cute::get<0, i>(stride_C) = problem_shape.stride_C[ConvProblemShape3x::RankT - 2 - i];
+{{indent}}});
+{{indent}}cute::for_each(cute::make_seq<cute::rank<0>({{instance_name}}_StrideD{})>{}, [&](auto i) {
+{{indent}}  cute::get<0, i>(stride_D) = problem_shape.stride_C[ConvProblemShape3x::RankT - 2 - i];
+{{indent}}});
+{{indent}}using {{instance_name}}_ElemA = typename {{instance_name}}::ElementA;
+{{indent}}using {{instance_name}}_ElemB = typename {{instance_name}}::ElementB;
+{{indent}}using {{instance_name}}_ElemC = typename {{instance_name}}::ElementC;
+{{indent}}using {{instance_name}}_ElemD = typename {{instance_name}}::ElementD;
+{{indent}}typename {{instance_name}}::Arguments arguments{
+{{indent}}    problem_shape,
+{{indent}}    { static_cast<const {{instance_name}}_ElemA*>(in_ptr), static_cast<const {{instance_name}}_ElemB*>(weight_ptr) },
+{{indent}}    {
+{{indent}}      {},                                                    // fusion thread args (set below)
+{% if is_bias_add %}
+{{indent}}      static_cast<const {{instance_name}}_ElemC*>(res_ptr),  // ptr_C (residual)
+{% else %}
+{{indent}}      nullptr,                                               // ptr_C (unused)
+{% endif %}
+{{indent}}      stride_C,
+{{indent}}      static_cast<{{instance_name}}_ElemD*>(out_ptr),        // ptr_D
+{{indent}}      stride_D
+{{indent}}    }
+{{indent}}};
+{{indent}}// alpha scales the f32 accumulator (1 for a plain conv).
+{{indent}}arguments.epilogue.thread.alpha = {{alpha_expr}};
+{% if is_bias_add %}
+{{indent}}// beta scales the residual source C (1 for the residual add).
+{{indent}}arguments.epilogue.thread.beta = {{beta_expr}};
+{% else %}
+{{indent}}arguments.epilogue.thread.beta = 0.0f;
+{% endif %}
+{% if is_bias or is_bias_add %}
+{{indent}}arguments.epilogue.thread.bias_ptr = static_cast<const {{bias_elem}}*>(bias_ptr);
+{% endif %}
+{{indent}}{{instance_name}} conv_op;
+{% if is_profiler %}
+{{indent}}size_t workspace_size = conv_op.get_workspace_size(arguments);
+{{indent}}cutlass::device_memory::allocation<uint8_t> local_workspace(workspace_size);
+{{indent}}workspace = local_workspace.get();
+{{indent}}GLOBAL_WORKSPACE_SIZE_{{instance_name}} = workspace_size;
+{% endif %}
+{{indent}}auto status = conv_op.can_implement(arguments);
+{{indent}}CUTLASS_CHECK(status);
+{{indent}}status = conv_op.initialize(arguments, workspace, stream);
+{{indent}}CUTLASS_CHECK(status);
+{{indent}}status = conv_op(stream);
+{{indent}}CUTLASS_CHECK(status);
+{{indent}}return;
+"""
+)
+
+BENCHMARK_TEMPLATE_3X = jinja2.Template(
+    """
+int benchmark_{{function_name}} (
+  float* runtime,
+  size_t* workspace_size,
+  int64_t NI,
+  int64_t HI,
+  int64_t WI,
+  int64_t CI,
+  int64_t CO,
+  int64_t KH,
+  int64_t KW,
+  int64_t NO,
+  int64_t HO,
+  int64_t WO,
+  int strideh,
+  int dilationh,
+  int padh,
+  int stridew,
+  int dilationw,
+  int padw,
+  uint8_t* global_workspace_,
+  cudaStream_t stream
+) {
+  using ElementInputA = typename {{instance_name}}::ElementA;
+  using ElementInputB = typename {{instance_name}}::ElementB;
+  using ElementOutput = typename {{instance_name}}::ElementD;
+
+  cutlass::HostTensor<ElementInputA, cutlass::layout::TensorNHWC> x({NI, HI, WI, CI});
+  cutlass::HostTensor<ElementInputB, cutlass::layout::TensorNHWC> w({CO, KH, KW, CI});
+{% if is_bias %}
+  cutlass::HostTensor<ElementInputA, cutlass::layout::TensorNHWC> b({(int)CO, 1, 1, 1});
+{% elif is_bias_add %}
+  cutlass::HostTensor<ElementInputA, cutlass::layout::TensorNHWC> b({(int)CO, 1, 1, 1});
+  cutlass::HostTensor<ElementOutput, cutlass::layout::TensorNHWC> r({NO, HO, WO, CO});
+{% endif %}
+  cutlass::HostTensor<ElementOutput, cutlass::layout::TensorNHWC> y({NO, HO, WO, CO});
+
+  // warmup
+{{func_call}}
+  cudaEvent_t events[2];
+  for (auto & event : events) {
+    cudaEventCreate(&event);
+  }
+  cudaEventRecord(events[0], stream);
+  for (int i = 0; i < 5; ++i) {
+{{func_call}}
+  }
+  cudaEventRecord(events[1], stream);
+  cudaEventSynchronize(events[1]);
+  float runtime_ms = 0;
+  cudaEventElapsedTime(&runtime_ms, events[0], events[1]);
+  for (auto event : events) {
+    (void)cudaEventDestroy(event);
+  }
+  if (runtime_ms < 0.00001) {
+      throw std::runtime_error(
+      "OOB in cutlass."
+    );
+  }
+  *runtime = runtime_ms;
+  *workspace_size = GLOBAL_WORKSPACE_SIZE_{{instance_name}};
+  return 0;
+}
+"""
+)
+
+
+def make_fusion_cpp(op, epilogue_name):
+    """Select the SM90 fusion epilogue op (and residual flag) for a conv op.
+
+    Maps AIT's conv epilogue name to a CUTLASS API 3.x fusion operation. Bias is
+    per-output-channel = per-K = the implicit-gemm column dim -> PerCol. All
+    three use fusion::LinCombPerColBiasEltAct, which computes
+        D = activation(alpha*acc + beta*C + per-col bias)
+    (sm90_callbacks_tma_warpspecialized.hpp:823-858). The residual (add) is the
+    full-tensor epilogue source C with beta=1, so the add happens *inside* the
+    activation -- matching the 2.x LinearCombinationResidualBlock, whose formula
+    is UnaryOp(BinaryOp(ActivationOp(acc+bias), residual)) = ReLu(acc+bias+res)
+    (linear_combination_residual_block.h:49). Using PerColResAddPerColBiasEltAct
+    here would instead give res + ReLu(acc+bias) (add *outside* the activation),
+    which is numerically different.
+      LinearCombination              -> Identity, no source (bias only)
+      LinearCombinationRelu          -> ReLu,     no source
+      LinearCombinationResidualBlock -> <unary_op>, source C = residual, beta=1
+    """
+    from cutlass_lib import library
+
+    elem_out = library.DataTypeTag[op.D.element]
+    elem_compute = library.DataTypeTag[op.element_compute]
+    elem_bias = library.DataTypeTag[op.C.element]
+
+    def _fusion(act):
+        return (
+            "cutlass::epilogue::fusion::LinCombPerColBiasEltAct<"
+            f"{act}, {elem_out}, {elem_compute}, {elem_bias}>"
+        )
+
+    if epilogue_name == "LinearCombinationResidualBlock":
+        # 2.x residual block: outer UnaryOp is the activation applied to
+        # (acc + bias + residual); inner ActivationOp is Identity here.
+        act = library.EpilogueMathTag[op.unary_op]
+        return _fusion(act), True
+    if epilogue_name == "LinearCombinationRelu":
+        return _fusion("cutlass::epilogue::thread::ReLu"), False
+    # default: plain bias (LinearCombination)
+    return _fusion("cutlass::epilogue::thread::Identity"), False
+
+
+def emit_instance_3x(op):
+    """Emit a CUTLASS API 3.x (SM90) conv instance with a fused epilogue.
+
+    Mirrors cutlass_library.conv3x_emitter.EmitConv3xInstance.emit (reusing its
+    shape/schedule helpers), but injects op._ait_fusion_cpp as the epilogue
+    CollectiveBuilder's fusion op.
+    """
+    from string import Template
+
+    from cutlass_lib import conv3x_emitter, library
+
+    e = conv3x_emitter.EmitConv3xInstance()
+
+    tile_shape = op.tile_description.tile_shape
+    # SM90 (arch < 100): no cta/cluster division, tile == cta shape.
+    cta_m, cta_n, cta_k = tile_shape
+
+    opcode_class_main = library.OpcodeClassTag[
+        op.tile_description.math_instruction.opcode_class
+    ]
+    kernel_schedule = library.KernelScheduleTag[op.kernel_schedule].replace(
+        "gemm::", "conv::"
+    )
+    values = {
+        "operation_name": op.procedural_name(),
+        "conv_kind": library.ConvKindTag[op.conv_kind],
+        "conv_kind_name": library.ConvKindNames[op.conv_kind].capitalize(),
+        "element_a": library.DataTypeTag[op.A.element],
+        "layout_a": library.LayoutTag[op.A.layout],
+        "element_b": library.DataTypeTag[op.B.element],
+        "layout_b": library.LayoutTag[op.B.layout],
+        "element_c": library.DataTypeTag[op.C.element],
+        "layout_c": library.LayoutTag[op.C.layout],
+        "element_d": library.DataTypeTag[op.D.element],
+        "layout_d": library.LayoutTag[op.D.layout],
+        "element_accumulator": library.DataTypeTag[op.accumulator_type()],
+        "arch": e.arch_number_to_type(op.arch),
+        "mma_tile_shape": e.mma_tile_shape(op, cta_m, cta_n, cta_k),
+        "cluster_shape": e.cluster_shape(op),
+        "opcode_class_epi": opcode_class_main,
+        "opcode_class_main": opcode_class_main,
+        "epi_tile_mn": "cutlass::epilogue::collective::EpilogueTileAuto",
+        "stages": e.stage_count(op),
+        "kernel_schedule": kernel_schedule,
+        "epilogue_schedule": library.EpilogueScheduleTag[op.epilogue_schedule],
+        "tile_scheduler": library.TileSchedulerTag[op.tile_scheduler],
+        "element_compute": library.DataTypeTag[op.element_compute],
+        "fusion_op": op._ait_fusion_cpp,
+    }
+    return Template(INSTANCE_TEMPLATE_3X_STR).substitute(values)
+
+
 def kernel_name(op, layout=None):
     """generate cuda kernel name"""
     from cutlass_lib import library
@@ -477,7 +873,12 @@ def kernel_name(op, layout=None):
         op.tile_description.math_instruction.opcode_class
     ]
     if layout is None:
-        layout = op.layout_name()
+        # ConvOperation3x (SM90) does not define layout_name(); fall back to the same
+        # short A-layout name the SM80 Conv2dOperation.layout_name() would produce.
+        if hasattr(op, "layout_name"):
+            layout = op.layout_name()
+        else:
+            layout = library.ShortLayoutTypeNames[op.A.layout]
     align_ab = op.A.alignment
     align_c = op.C.alignment
     name = KERNEL_KEY_TEMPLATE.render(
@@ -494,6 +895,12 @@ def kernel_name(op, layout=None):
 def emit_instance(op):
     """emit instance"""
     import cutlass_lib
+
+    # CUTLASS API 3.x (SM90) conv ops take a fully separate host path. Check this
+    # first: extract_config may set .binary_op on a 3x op (for residual epilogue
+    # bookkeeping), which must NOT route it to the 2.x WithBroadcast emitter.
+    if getattr(op, "is_3x", False):
+        return emit_instance_3x(op)
 
     if hasattr(op, "binary_op"):
         emiter = cutlass_lib.conv2d_operation.EmitConv2dWithBroadcastInstance()
@@ -517,8 +924,8 @@ def extract_config(
     import cutlass_lib
 
     spec = CUDASpec()
-    lib_dtype = spec.dtype_to_lib_type(dtype)
 
+    lib_dtype = spec.dtype_to_lib_type(dtype)
     if lib_dtype == "float":
         data_type = cutlass_lib.library.DataType.f32
         acc_type = cutlass_lib.library.DataType.f32
@@ -534,6 +941,9 @@ def extract_config(
         acc_type = cutlass_lib.library.DataType.f32
     else:
         raise RuntimeError(f"Unsupported dtype {lib_dtype}")
+    ab_type = data_type
+    c_type = data_type
+    d_type = data_type
 
     def f_proc_op(op):
         ret = []
@@ -544,18 +954,58 @@ def extract_config(
         ):
             return ret
 
+        # CUTLASS API 3.x conv ops (ConvOperation3x, is_3x=True) are Hopper (SM90) kernels
+        # that carry a different attribute set than the SM80 Conv2dOperation. In
+        # particular they have no `iterator_algorithm` (that is an SM80-only concept)
+        # and they select the epilogue via epilogue_schedule/kernel_schedule rather
+        # than `epilogue_functor`/`element_epilogue`. Gate those SM80-only accesses on
+        # the op version, mirroring how the gemm path keys off GemmKind.Universal3x.
+        is_3x = getattr(op, "is_3x", False)
+
+        # CUTLASS API 3.x (SM90 / Hopper) native conv path. These ConvOperation3x ops
+        # carry no iterator_algorithm/epilogue_functor; the fused epilogue is
+        # hand-authored (see emit_instance_3x / make_fusion_cpp) from the AIT
+        # epilogue name. Only the TMA warp-specialized align-8 f16 kernels are
+        # realizable, so we keep the op's native alignment (8) rather than
+        # expanding low-alignment variants that would not compile.
+        if is_3x:
+            # ConvOperation3x: match the op's A/B/C/D element types (all == data_type
+            # for a given precision) and its accumulator against the requested config.
+            if not (
+                op.A.element == ab_type
+                and op.B.element == ab_type
+                and op.C.element == c_type
+                and op.D.element == d_type
+                and op.accumulator_type() == acc_type
+            ):
+                return ret
+            op = copy.deepcopy(op)
+            epilogue_name = func_attrs["epilogue"]
+            # apply special config if required (sets activation/binary/unary_op
+            # on residual ops; harmless bookkeeping for the 3x emitter).
+            if f_apply_special_config is not None:
+                op = f_apply_special_config(func_attrs, op)
+            fusion_cpp, is_residual = make_fusion_cpp(op, epilogue_name)
+            op._ait_fusion_cpp = fusion_cpp
+            op._ait_is_residual = is_residual
+            ret.append(op)
+            return ret
+
         if (
             op.A.element == data_type
             and op.B.element == data_type
             and op.C.element == data_type
-            and op.iterator_algorithm == cutlass_lib.library.IteratorAlgorithm.Optimized
+            and op.iterator_algorithm
+            == cutlass_lib.library.IteratorAlgorithm.Optimized
             and op.tile_description.math_instruction.element_accumulator == acc_type
         ):
             op = copy.deepcopy(op)
 
             # set epilogue
             epilogue_name = func_attrs["epilogue"]
-            op.epilogue_functor = cutlass_lib.library.EpilogueFunctorName[epilogue_name]
+            op.epilogue_functor = cutlass_lib.library.EpilogueFunctorName[
+                epilogue_name
+            ]
             op.element_epilogue = acc_type
 
             # apply special config if required
@@ -623,40 +1073,73 @@ def gen_profiler(
     profiler_benchmarks = {}
 
     for instance_idx, (op_name, op) in enumerate(op_instance.items()):
+        is_3x = getattr(op, "is_3x", False)
         config = f_emit_instance(op)
-        config_name = extract_config_name(config)
         instance_name = f"{instance_name_base}_{instance_idx}"
         function_name = f"{op_type}_{op_name}"
 
-        exec_program = EXEC_TEMPLATE.render(
-            indent="  ",
-            is_profiler=True,
-            is_bias=is_bias,
-            is_bias_add=is_bias_add,
-            instance_name=instance_name,
-            dtype=dtype,
-        )
-        instance = INSTANCE_TEMPLATE.render(
-            config_name=config_name,
-            name=instance_name,
-            config=config,
-        )
-        function = FUNCTION_TEMPLATE.render(
-            is_bias=is_bias,
-            is_bias_add=is_bias_add,
-            is_transpose=is_transpose,
-            is_depthwise=is_depthwise,
-            function_name=function_name,
-            shape_function="",
-            exec_paths=exec_program,
-        )
-        op_source = SRC_TEMPLATE.render(
-            is_transpose=is_transpose,
-            is_depthwise=is_depthwise,
-            extra_header=extra_header,
-            instances=instance,
-            functions=function,
-        )
+        if is_3x:
+            config_name = op.procedural_name() + "_base"
+            exec_program = EXEC_TEMPLATE_3X.render(
+                indent="  ",
+                is_profiler=True,
+                is_bias=is_bias,
+                is_bias_add=is_bias_add,
+                instance_name=instance_name,
+                dtype=dtype,
+                # Profiler only measures latency, so alpha/beta are baked to 1.0.
+                alpha_expr="1.0f",
+                beta_expr="1.0f",
+                bias_elem=f"{instance_name}_ElemC",
+            )
+            instance = INSTANCE_TEMPLATE_3X.render(
+                config_name=config_name,
+                name=instance_name,
+                config=config,
+            )
+            function = FUNCTION_TEMPLATE_3X.render(
+                is_bias=is_bias,
+                is_bias_add=is_bias_add,
+                function_name=function_name,
+                shape_function="",
+                exec_paths=exec_program,
+            )
+            op_source = SRC_TEMPLATE_3X.render(
+                extra_header="",
+                instances=instance,
+                functions=function,
+            )
+        else:
+            config_name = extract_config_name(config)
+            exec_program = EXEC_TEMPLATE.render(
+                indent="  ",
+                is_profiler=True,
+                is_bias=is_bias,
+                is_bias_add=is_bias_add,
+                instance_name=instance_name,
+                dtype=dtype,
+            )
+            instance = INSTANCE_TEMPLATE.render(
+                config_name=config_name,
+                name=instance_name,
+                config=config,
+            )
+            function = FUNCTION_TEMPLATE.render(
+                is_bias=is_bias,
+                is_bias_add=is_bias_add,
+                is_transpose=is_transpose,
+                is_depthwise=is_depthwise,
+                function_name=function_name,
+                shape_function="",
+                exec_paths=exec_program,
+            )
+            op_source = SRC_TEMPLATE.render(
+                is_transpose=is_transpose,
+                is_depthwise=is_depthwise,
+                extra_header=extra_header,
+                instances=instance,
+                functions=function,
+            )
 
         func_call = FUNC_CALL_TEMPLATE.render(
             indent="  ",
@@ -684,7 +1167,8 @@ def gen_profiler(
             dilationw="dilationw",
             padw="padw",
         )
-        benchmark = BENCHMARK_TEMPLATE.render(
+        benchmark_tmpl = BENCHMARK_TEMPLATE_3X if is_3x else BENCHMARK_TEMPLATE
+        benchmark = benchmark_tmpl.render(
             is_bias=is_bias,
             is_bias_add=is_bias_add,
             instance_name_base=instance_name_base,
@@ -791,27 +1275,46 @@ def gen_function(
     exec_path = func_attrs["exec_path"]
     op_instance = func_attrs["op_instance"]
 
+    is_3x = any(
+        getattr(op, "is_3x", False) for op in op_instance.values()
+    )
+
     inst_def_flag = set()
     instances = {}
     instance_decl = ""
     for key, value in exec_path.items():
         fname = "f" + sha1(key.encode()).hexdigest()
-        emitted_instance = f_emit_instance(op_instance[value])
+        op = op_instance[value]
+        emitted_instance = f_emit_instance(op)
         if value not in inst_def_flag:
             inst_def_flag.add(value)
             config = emitted_instance
         else:
             config = ""
-        inst = INSTANCE_TEMPLATE.render(
-            config=config,
-            name=fname,
-            config_name=extract_config_name(emitted_instance),
-        )
+        if getattr(op, "is_3x", False):
+            config_name = op.procedural_name() + "_base"
+            inst = INSTANCE_TEMPLATE_3X.render(
+                config=config,
+                name=fname,
+                config_name=config_name,
+            )
+        else:
+            inst = INSTANCE_TEMPLATE.render(
+                config=config,
+                name=fname,
+                config_name=extract_config_name(emitted_instance),
+            )
         instances[key] = inst
         instance_decl += inst
 
     backend_spec = CUDASpec()
-    dtype = backend_spec.dtype_to_lib_type(func_attrs["inputs"][0]._attrs["dtype"])
+    in_dtype = func_attrs["inputs"][0]._attrs["dtype"]
+    dtype = backend_spec.dtype_to_lib_type(in_dtype)
+    # SM90 3.x conv epilogue: alpha scales the accumulator, beta the residual source;
+    # both 1.0 for a plain conv. bias_elem=None -> the instance's own ElemC below.
+    alpha_expr = "1.0f"
+    beta_expr = "1.0f"
+    bias_elem = None
     shape_eval_func = shape_eval_template.render(
         indent="  ",
         dtype="int64_t ",
@@ -839,18 +1342,36 @@ def gen_function(
     )
     shape_func = shape_eval_func + shape_save_func
 
+    exec_tmpl = EXEC_TEMPLATE_3X if is_3x else EXEC_TEMPLATE
     exec_paths = ""
     for key in instances:
         fname = "f" + sha1(key.encode()).hexdigest()
-        program = EXEC_TEMPLATE.render(
+        program = exec_tmpl.render(
             is_bias=is_bias,
             is_bias_add=is_bias_add,
             indent=" " * 4,
             instance_name=fname,
             dtype=dtype,
+            alpha_expr=alpha_expr,
+            beta_expr=beta_expr,
+            bias_elem=(bias_elem if bias_elem is not None else f"{fname}_ElemC"),
         )
         exec_inst = exec_cond_template.render(indent="  ", cond=key, program=program)
         exec_paths += exec_inst
+
+    if is_3x:
+        function = FUNCTION_TEMPLATE_3X.render(
+            is_bias=is_bias,
+            is_bias_add=is_bias_add,
+            function_name=func_name,
+            shape_function=shape_func,
+            exec_paths=exec_paths,
+        )
+        return SRC_TEMPLATE_3X.render(
+            extra_header="",
+            instances=instance_decl,
+            functions=function,
+        )
 
     function = FUNCTION_TEMPLATE.render(
         is_bias=is_bias,

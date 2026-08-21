@@ -183,6 +183,38 @@ class EpilogueScheduleType(enum.Enum):
   TmaWarpSpecializedCooperativeBiasElementwiseGELU = enum_auto()
   TmaWarpSpecializedBiasElementwiseFastGELU = enum_auto()
   TmaWarpSpecializedCooperativeBiasElementwiseFastGELU = enum_auto()
+  # cutlass v4.6.1 EpilogueScheduleType members (SM100/SM120/Nvf4/Mxf4/PtrArray/Sparse)
+  # NOT emitted by our SM90 fp16 gemm configs, but this enum SHADOWS cutlass's own (it
+  # is appended last into the generated library.py), so cutlass's copied code -- e.g.
+  # is_tma_epilogue()'s membership list -- must still resolve these names. Bare members
+  # (no Tag/Suffix entry): they exist only for those lookups; if one were ever actually
+  # emitted, the missing Tag key would raise loudly rather than pick a wrong kernel.
+  PtrArrayNoSmemWarpSpecialized = enum_auto()
+  NoSmemWarpSpecialized1Sm = enum_auto()
+  NoSmemWarpSpecialized2Sm = enum_auto()
+  FastF32NoSmemWarpSpecialized1Sm = enum_auto()
+  FastF32NoSmemWarpSpecialized2Sm = enum_auto()
+  BlockwiseNoSmemWarpSpecialized1Sm = enum_auto()
+  BlockwiseNoSmemWarpSpecialized2Sm = enum_auto()
+  PtrArrayNoSmemWarpSpecialized1Sm = enum_auto()
+  PtrArrayNoSmemWarpSpecialized2Sm = enum_auto()
+  PtrArrayFastF32NoSmemWarpSpecialized1Sm = enum_auto()
+  PtrArrayFastF32NoSmemWarpSpecialized2Sm = enum_auto()
+  PtrArrayBlockwiseNoSmemWarpSpecialized1Sm = enum_auto()
+  PtrArrayBlockwiseNoSmemWarpSpecialized2Sm = enum_auto()
+  TmaWarpSpecialized1Sm = enum_auto()
+  TmaWarpSpecialized2Sm = enum_auto()
+  PtrArrayTmaWarpSpecialized1Sm = enum_auto()
+  PtrArrayTmaWarpSpecialized2Sm = enum_auto()
+  PtrArrayTmaWarpSpecializedPingpong = enum_auto()
+  PtrArrayTmaWarpSpecializedCooperative = enum_auto()
+  TmaWarpSpecialized1SmNvf4 = enum_auto()
+  TmaWarpSpecialized2SmNvf4 = enum_auto()
+  TmaWarpSpecialized1SmMxf4 = enum_auto()
+  TmaWarpSpecialized2SmMxf4 = enum_auto()
+  TmaWarpSpecialized1SmMxf8f6f4 = enum_auto()
+  TmaWarpSpecialized2SmMxf8f6f4 = enum_auto()
+  SparseTmaWarpSpecializedCooperativeSm120 = enum_auto()
 
 EpilogueScheduleTag = {
   EpilogueScheduleType.ScheduleAuto: 'cutlass::epilogue::collective::EpilogueScheduleAuto',

@@ -739,7 +739,7 @@ def universal_gemm_instance(
 ) -> str:
     if cutlass_3x:
         # We don't need to make any adjustments to the emitted
-        # CUTLASS 3.x op definitions. In particular, the alignments
+        # CUTLASS API 3.x op definitions. In particular, the alignments
         # should not be updated, as the op instances incompatible
         # with the TA-specified alignments have been removed from
         # consideration by the filter_cutlass_3x_ops function.
@@ -923,7 +923,7 @@ def gen_function(
             indent="    ",
             instance=fname,
             # need to omit irrelevant problem_args here as in
-            # non-templated function both CUTLASS 2.x and 3.x
+            # non-templated function both CUTLASS API 2.x and 3.x
             # code branches are syntactically checked
             problem_args=(problem_args if not cutlass_3x else ""),
             problem_args_cutlass_3x=(problem_args_cutlass_3x if cutlass_3x else ""),
@@ -1002,7 +1002,10 @@ def add_profiler(file_pairs, workdir, op_type, output_name, code):
 
 
 def has_tma_epilogue(op):
-    """Check whether the op is CUTLASS 3.x and has a TMA epilogue schedule."""
+    """Check whether the op is CUTLASS API 3.x and has a TMA epilogue schedule.
+
+    ("API 3.x" = the collective API generation, not the release -- vendored is 4.7.)
+    """
     import cutlass_lib
 
     result = False
@@ -1014,22 +1017,22 @@ def has_tma_epilogue(op):
 
 
 def filter_cutlass_3x_ops(op_instance, func_attrs):
-    """Filter out CUTLASS 3.x ops with incompatible alignment requirements.
+    """Filter out CUTLASS API 3.x ops with incompatible alignment requirements.
 
-    The CUTLASS 3.x ops have stricter alignment requirements compared to
-    the CUTLASS 2.x ops (due to TMA). These alignment requirements are used
+    The CUTLASS API 3.x ops have stricter alignment requirements compared to
+    the CUTLASS API 2.x ops (due to TMA). These alignment requirements are used
     to initially filter them out in the `function_filter` below. However, the
     required alignments of the GEMM op inputs and outputs may change due to
     TensorAccessor-related optimizations, which are introduced to the model
     graph *after* the initial filtering.
 
     In this function, the (possible) TA-related alignment updates are checked
-    once again and the CUTLASS 3.x ops not satisfying these requirements are
+    once again and the CUTLASS API 3.x ops not satisfying these requirements are
     filtered out. Importantly, due to input/output alignment flexibilit of the
-    CUTLASS 2.x ops, their alignment requirements are corrected using the
+    CUTLASS API 2.x ops, their alignment requirements are corrected using the
     TA-imposed alignments in the `update_alignments_in_gemm_instance` function
-    above. But this correction is not possible for the CUTLASS 3.x ops, as they
-    won't work with the lower alignment values. That's why the CUTLASS 3.x ops
+    above. But this correction is not possible for the CUTLASS API 3.x ops, as they
+    won't work with the lower alignment values. That's why the CUTLASS API 3.x ops
     are filtered out by this function in such cases.
     """
     import cutlass_lib
@@ -1065,7 +1068,7 @@ def filter_cutlass_3x_ops(op_instance, func_attrs):
             }
 
     return {
-        # CUTLASS 3.x kernels can cause power throttling:
+        # CUTLASS API 3.x kernels can cause power throttling:
         # we want to generate the 2.x kernels first to avoid
         # performance side effects caused by the 3.x kernels
         **result_2x,
@@ -1375,10 +1378,57 @@ def default_fproc(
                 op.epilogue_schedule = cutlass_lib.library.EpilogueScheduleMapping[
                     op.epilogue_schedule
                 ][op.epilogue_functor]
+                # For pure-activation functors the mapping selects a legacy
+                # TmaWarpSpecialized*Elementwise<Act> schedule. In cutlass v4.6.1 that
+                # builder (sm90_builder.inl, "DEPRECATED ... elementwise fusion") derives
+                # the fusion (fusion::LinCombEltAct<Act>) from the SCHEDULE and IGNORES the
+                # FusionOperation template arg (declared `UnusedFusionOp`). The base
+                # epilogue functor therefore must be a valid 3x functor -- the 3x emitter
+                # indexes EpilogueFunctor3xTag[op.epilogue_functor] and would KeyError on
+                # the 2x LinearCombinationRelu/etc. Convert it to the plain 3x
+                # LinearCombination; the activation is carried by the schedule and the bias
+                # (if any) stays the epilogue source C, exactly like plain gemm_rcr_bias.
+                #
+                # Do NOT convert for LinearCombinationResidualBlock: its mapping keeps the
+                # plain TmaWarpSpecialized schedule and the residual is expressed through
+                # the fusion functor itself, which must be preserved.
+                schedule_name = str(op.epilogue_schedule).split(".")[-1]
+                if "Elementwise" in schedule_name and "Bias" not in schedule_name:
+                    op.epilogue_functor = (
+                        cutlass_lib.library.EpilogueFunctor3x.LinearCombination
+                    )
             else:
                 # epilogue functor parameterization unavailable
                 # for the rest of epilogue schedule types
                 return ret
+
+        # This AITemplate fork's CUTLASS API 3.x gemm host codegen only supports TMA
+        # warp-specialized epilogues. The low-alignment NoSmemWarpSpecialized 3.x ops
+        # (the only 3.x option when the output N is not a multiple of 8, e.g. the
+        # policy/value heads) have a plain thread::LinearCombination epilogue whose
+        # Arguments do NOT match the fusion-callback Arguments emitted by the 3.x
+        # problem_args template -> they fail to compile ("too many initializer values"
+        # / "no instance of constructor ...Arguments"). Drop every non-TMA 3.x op here
+        # so it is never emitted; such gemms fall back to the SM80 2.x kernels generated
+        # alongside the forced SM90 pool (see backend/cuda/utils.py:gen_ops). No effect
+        # on the default SM80-only path, which has no Universal3x ops at all.
+        if (
+            op.gemm_kind == cutlass_lib.library.GemmKind.Universal3x
+            and not has_tma_epilogue(op)
+        ):
+            return ret
+
+        # Universal3x kernels tag the epilogue via EpilogueFunctor3xTag, which is keyed
+        # by EpilogueFunctor3x -- the 2x EpilogueFunctor.LinearCombination set above is
+        # not a key there, so the 3x emitter KeyErrors on a plain-LinearCombination gemm
+        # (e.g. the policy head). Convert it here, mirroring GemmOperation.__init__. The
+        # non-LinearCombination 3x epilogues are already handled by the block above.
+        if (
+            op.gemm_kind == cutlass_lib.library.GemmKind.Universal3x
+            and op.epilogue_functor
+            == cutlass_lib.library.EpilogueFunctor.LinearCombination
+        ):
+            op.epilogue_functor = cutlass_lib.library.EpilogueFunctor3x.LinearCombination
 
         # set permute layout
         if permute_layout is not None:
