@@ -44,6 +44,9 @@ MODEL_TEMPLATE = jinja2.Template(
 
 namespace ait {
 
+// Defined in model_container.cu; drains the cutedsl loader registry (eager FA4 module load).
+void _cutedsl_load_all();
+
 // Model is the class that actually performs inference. It owns memory for
 // intermediate tensors and dynamic dimensions. Constants are owned by
 // the model's owning container object, and input/output memory is owned
@@ -100,6 +103,9 @@ class {{model_name}} : public ModelBase<{{model_name}}> {
       }
       DEVICE_CHECK(CreateEvent(&sub_event_base, false));
       {% endif %}
+      // Eager-load cutedsl (FA4) kernel modules now, while a CUDA context is live and no
+      // graph capture is in progress, so the first forward is graph-capturable (no warmup).
+      _cutedsl_load_all();
     }
 
     ~{{model_name}}() {
@@ -322,8 +328,22 @@ MODEL_CONTAINER_TEMPLATE = jinja2.Template(
     """
 #include "model_container.h"
 #include "owned_constants.h"
+#include <vector>
 
 namespace ait {
+
+// CuTeDSL module-load registry. cutedsl ops register their (idempotent) loader at static
+// init; the Model constructor drains this once, with a live CUDA context, so the AOT kernel
+// module is loaded eagerly at ModelContainerCreate -- no first-forward warmup / graph-mode
+// special-casing needed (module load is illegal mid graph-capture, but fine here).
+std::vector<void (*)()>& _cutedsl_loaders() {
+  static std::vector<void (*)()> v;
+  return v;
+}
+void _cutedsl_load_all() {
+  for (auto f : _cutedsl_loaders()) f();
+}
+
 namespace {
 
 {% if is_windows %}

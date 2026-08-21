@@ -111,6 +111,10 @@ class FlashAttentionFwdSm90Aot:
         mLSE: cute.Tensor,
         stream: cuda.CUstream,
     ):
+        # Pass stream as a KEYWORD: upstream flash-attn added params before `stream`
+        # (mCuTotalMBlocks/mCuTotalSplitsMBlocks etc.), so a positional stream lands
+        # on the wrong slot and the real stream defaults to None -> None operand in
+        # cuda.launch_cfg.create. Optionals default to None / AuxData(). (SM90/H200.)
         self.fa(
             mQ,
             mK,
@@ -118,15 +122,5 @@ class FlashAttentionFwdSm90Aot:
             mO,
             mLSE,
             self.softmax_scale,
-            None,  # cu_seqlens_q
-            None,  # cu_seqlens_k
-            None,  # seqused_q
-            None,  # seqused_k
-            None,  # page_table
-            None,  # window_size_left
-            None,  # window_size_right
-            None,  # learnable_sink
-            None,  # blocksparse_tensors
-            AuxData(),  # aux_data (compile-time constant)
-            stream,
+            stream=stream,
         )

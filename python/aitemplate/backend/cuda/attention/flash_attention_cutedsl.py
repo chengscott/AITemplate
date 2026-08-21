@@ -278,15 +278,38 @@ def flash_attention_gen_function_call_cutedsl(func_attrs, indent="  "):
     x = func_attrs["inputs"][0]
     output_name = func_attrs["outputs"][0]._attrs["name"]
     qkv_name = x._attrs["name"]
-    seqlens_name = _v1.FUNC_CALL_INT32_PARAM_TEMPLATE.render(
-        name=func_attrs["inputs"][1]._attrs["name"]
-    )
+    # cu_seqlens is optional: the dense/equal-length cutedsl path voids it, so callers may
+    # omit the input -> pass nullptr (avoids a dummy constant in an inference graph).
+    if len(func_attrs["inputs"]) > 1:
+        seqlens_name = _v1.FUNC_CALL_INT32_PARAM_TEMPLATE.render(
+            name=func_attrs["inputs"][1]._attrs["name"]
+        )
+    else:
+        seqlens_name = "nullptr"
 
-    batch_size = func_attrs["batch_size"]
+    batch_size = func_attrs["batch_size"]  # static max, for workspace/LSE sizing
     seq_len = func_attrs["max_seq_len"]  # actual length (not the 256-padded one)
-    num_heads = x._attrs["shape"][2]._attrs["values"][0]
-    head_size = x._attrs["shape"][3]._attrs["values"][0]
+    xshape = x._attrs["shape"]
+    dense5d = len(xshape) == 5  # [B,S,3,H,D] vs packed 4D [total,3,H,D]
+    num_heads = xshape[3 if dense5d else 2]._attrs["values"][0]
+    head_size = xshape[4 if dense5d else 3]._attrs["values"][0]
     softmax_scale = head_size ** (-0.5)
+
+    # Runtime batch for the kernel grid. Passing the baked max makes the kernel
+    # process batch_size batches and write past the (runtime-sized) output for any
+    # runtime B < batch_size, so a DYNAMIC batch must use the runtime dim variable.
+    # 5D: dim0 IS B, use it directly. 4D packed: dim0 = total = B*seq_len, so
+    # B = total / seq_len (exact). Workspace/LSE below keep the constant max, so
+    # they never underflow at smaller runtime batch.
+    dim0 = xshape[0]
+    if len(dim0._attrs["values"]) > 1:  # dynamic batch
+        batch_arg = (
+            dim0._attrs["name"]
+            if dense5d
+            else "({} / {})".format(dim0._attrs["name"], seq_len)
+        )
+    else:
+        batch_arg = str(dim0._attrs["values"][0] if dense5d else batch_size)
 
     return _v1.FUNC_CALL_TEMPLATE.render(
         func_name=func_attrs["name"],
@@ -297,7 +320,7 @@ def flash_attention_gen_function_call_cutedsl(func_attrs, indent="  "):
         o_tmp="reinterpret_cast<float*>(global_workspace_ + {} * sizeof(float))".format(
             batch_size * num_heads * func_attrs["seq_len"]
         ),
-        batch_size=batch_size,
+        batch_size=batch_arg,
         seq_len=seq_len,
         num_heads=num_heads,
         head_size=head_size,
@@ -306,4 +329,164 @@ def flash_attention_gen_function_call_cutedsl(func_attrs, indent="  "):
         is_causal="true" if func_attrs["causal"] else "false",
         loop="true" if seq_len > 256 else "false",
         indent=indent,
+    )
+
+
+# =============================================================================
+# q,k,v-separate FA4 op (flash_attention_qkv): O = FA4(Q,K,V) with Q,K,V,O each a
+# contiguous [B,S,H,D] tensor -- NO packed-qkv concatenate. The AOT FA4 kernel already
+# takes 3 separate tensor descriptors (compiled from separate contiguous q/k/v), so this
+# only feeds them directly with contiguous strides. This is the fused-attention op backed
+# by FA4 (the DotProductAttention / nvte_fused_attn role, cuDNN replaced by FA4).
+# =============================================================================
+
+FA4_QKV_SIGNATURE = jinja2.Template(
+    "void {{func_name}}(void* q, void* k, void* v, void* o, int64_t B, "
+    "uint8_t* workspace, cudaStream_t stream)"
+)
+
+FA4_QKV_WRAPPER_TEMPLATE = jinja2.Template(
+    """
+// Auto-generated CuTeDSL/FA4 q,k,v wrapper for {{func_name}}
+#include <cuda.h>
+#include <cuda_runtime.h>
+#include <cuda_fp16.h>
+#include <cstdint>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+#include "{{cutedsl_header}}"
+
+// Registry (defined in model_container.cu) drained by the Model ctor -> eager module load.
+namespace ait { extern std::vector<void (*)()>& _cutedsl_loaders(); }
+
+namespace {
+static {{func_name}}_cutedsl_Kernel_Module_t g_meta_{{func_name}};
+static bool g_loaded_{{func_name}} = false;
+static void ensure_cu_init_{{func_name}}() {
+    static bool inited = false;
+    if (!inited) {
+        CUresult r = cuInit(0);
+        if (r != CUDA_SUCCESS) { const char* e = nullptr; cuGetErrorString(r, &e);
+            throw std::runtime_error(std::string("cuInit failed: ") + (e ? e : "?")); }
+        inited = true;
+    }
+}
+static void ensure_loaded_{{func_name}}() {
+    if (!g_loaded_{{func_name}}) {
+        ensure_cu_init_{{func_name}}();
+        {{func_name}}_cutedsl_Kernel_Module_Load(&g_meta_{{func_name}});
+        g_loaded_{{func_name}} = true;
+    }
+}
+// Register the loader at static init; the Model ctor drains the registry with a live
+// context, so the module is loaded eagerly (before any graph capture).
+struct {{func_name}}_reg_t {
+    {{func_name}}_reg_t() { ait::_cutedsl_loaders().push_back(&ensure_loaded_{{func_name}}); }
+};
+static {{func_name}}_reg_t {{func_name}}_reg_inst;
+}  // namespace
+
+{{func_signature}} {
+    ensure_loaded_{{func_name}}();  // no-op after eager load; kept for safety
+    const int64_t S = {{s}}, Hh = {{h}}, D = {{d}};
+    const int64_t row = Hh * D;  // contiguous [B,S,H,D]: stride between (b,s) rows
+
+    {{func_name}}_cutedsl_Tensor_mQ_t tQ;
+    tQ.data = q;
+    tQ.dynamic_shapes[0] = (int32_t)B; tQ.dynamic_shapes[1] = (int32_t)S;
+    tQ.dynamic_shapes[2] = (int32_t)Hh; tQ.dynamic_shapes[3] = (int32_t)D;
+    tQ.dynamic_strides[0] = S * row; tQ.dynamic_strides[1] = row; tQ.dynamic_strides[2] = D;
+
+    {{func_name}}_cutedsl_Tensor_mK_t tK;
+    tK.data = k;
+    tK.dynamic_shapes[0] = (int32_t)B; tK.dynamic_shapes[1] = (int32_t)S;
+    tK.dynamic_shapes[2] = (int32_t)Hh; tK.dynamic_shapes[3] = (int32_t)D;
+    tK.dynamic_strides[0] = S * row; tK.dynamic_strides[1] = row; tK.dynamic_strides[2] = D;
+
+    {{func_name}}_cutedsl_Tensor_mV_t tV;
+    tV.data = v;
+    tV.dynamic_shapes[0] = (int32_t)B; tV.dynamic_shapes[1] = (int32_t)S;
+    tV.dynamic_shapes[2] = (int32_t)Hh; tV.dynamic_shapes[3] = (int32_t)D;
+    tV.dynamic_strides[0] = S * row; tV.dynamic_strides[1] = row; tV.dynamic_strides[2] = D;
+
+    {{func_name}}_cutedsl_Tensor_mO_t tO;
+    tO.data = o;
+    tO.dynamic_shapes[0] = (int32_t)B; tO.dynamic_shapes[1] = (int32_t)S;
+    tO.dynamic_shapes[2] = (int32_t)Hh; tO.dynamic_shapes[3] = (int32_t)D;
+    tO.dynamic_strides[0] = S * row; tO.dynamic_strides[1] = row; tO.dynamic_strides[2] = D;
+
+    {{func_name}}_cutedsl_Tensor_mLSE_t tL;
+    tL.data = reinterpret_cast<float*>(workspace);   // [B,H,S] fp32 softmax-lse scratch
+    tL.dynamic_shapes[0] = (int32_t)B; tL.dynamic_shapes[1] = (int32_t)Hh;
+    tL.dynamic_shapes[2] = (int32_t)S;
+    tL.dynamic_strides[0] = Hh * S; tL.dynamic_strides[1] = S;
+
+    cute_dsl_{{func_name}}_cutedsl_wrapper(
+        &g_meta_{{func_name}}, &tQ, &tK, &tV, &tO, &tL, stream);
+}
+"""
+)
+
+FA4_QKV_DECL_TEMPLATE = jinja2.Template("{{func_signature}};\n")
+
+FA4_QKV_CALL_TEMPLATE = jinja2.Template(
+    """
+{{indent}}{{func_name}}(
+{{indent}}    {{q}}, {{k}}, {{v}}, {{o}},
+{{indent}}    {{b_expr}}, global_workspace_, stream
+{{indent}});
+"""
+)
+
+
+@registry.reg("cuda.flash_attention_qkv.gen_function")
+def flash_attention_qkv_gen_function_cutedsl(func_attrs: Dict[str, Any]) -> str:
+    current_target = Target.current()
+    arch = int(current_target._arch)
+    if arch < 80:
+        raise NotImplementedError(
+            f"FA4 CuTeDSL flash_attention_qkv requires SM80+, got SM{arch}"
+        )
+    workdir = func_attrs.get("workdir", "/tmp/ait_cutedsl")
+    func_name = func_attrs["name"]
+    _, o_path = _aot_compile_cutedsl_kernel(
+        output_dir=workdir,
+        func_name=func_name,
+        head_dim=func_attrs["head_dim"],
+        is_causal=bool(func_attrs["causal"]),
+        arch=arch,
+    )
+    func_attrs["cutedsl_obj_path"] = o_path
+    sig = FA4_QKV_SIGNATURE.render(func_name=func_name)
+    return FA4_QKV_WRAPPER_TEMPLATE.render(
+        func_name=func_name,
+        func_signature=sig,
+        cutedsl_header=f"{func_name}_cutedsl.h",
+        s=func_attrs["seq_len"],
+        h=func_attrs["heads"],
+        d=func_attrs["head_dim"],
+    )
+
+
+@registry.reg("cuda.flash_attention_qkv.func_decl")
+def flash_attention_qkv_gen_function_decl(func_attrs: Dict[str, Any]):
+    return FA4_QKV_DECL_TEMPLATE.render(
+        func_signature=FA4_QKV_SIGNATURE.render(func_name=func_attrs["name"])
+    )
+
+
+@registry.reg("cuda.flash_attention_qkv.func_call")
+def flash_attention_qkv_gen_function_call(func_attrs, indent="  "):
+    q, k, v = func_attrs["inputs"]
+    o = func_attrs["outputs"][0]
+    return FA4_QKV_CALL_TEMPLATE.render(
+        indent=indent,
+        func_name=func_attrs["name"],
+        q=q._attrs["name"],
+        k=k._attrs["name"],
+        v=v._attrs["name"],
+        o=o._attrs["name"],
+        b_expr=q._attrs["shape"][0]._attrs["name"],
     )

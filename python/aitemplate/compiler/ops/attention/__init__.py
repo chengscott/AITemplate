@@ -17,7 +17,12 @@ flash attention module init
 """
 
 from aitemplate.compiler.ops.attention.flash_attention import flash_attention
+from aitemplate.compiler.ops.attention.flash_attention_qkv import flash_attention_qkv
 from aitemplate.compiler.ops.attention.mem_eff_attention import mem_eff_attention
 
 
-__all__ = ["flash_attention", "mem_eff_attention"]
+__all__ = [
+    "flash_attention",
+    "flash_attention_qkv",
+    "mem_eff_attention",
+]

@@ -114,36 +114,30 @@ class flash_attention(Operator):
         ]
         return output_shape
 
-    def __call__(self, x: Tensor, cu_seqlens: Tensor) -> Tensor:
+    def __call__(self, x: Tensor, cu_seqlens: Tensor = None) -> Tensor:
         """call the op
 
         Parameters
         ----------
         x : float16
-            QKV tensor
-            shape: (batch*seqlen, 3, num_heads, head_size)
-        cu_seqlens : int
-            seq lens tensor
-            shape (batch_size + 1)
+            QKV tensor. Packed 4D (batch*seqlen, 3, num_heads, head_size), or dense 5D
+            (batch, seqlen, 3, num_heads, head_size) for the equal-length cutedsl path.
+        cu_seqlens : int, optional
+            Cumulative seq lens, shape (batch_size + 1). Required for the packed 4D path
+            (variable-length masking). The dense 5D cutedsl path is equal-length and does
+            not read it, so it may be omitted (a nullptr is passed) -- this avoids a dummy
+            constant when the op is embedded in a larger inference graph.
 
         Returns
         ----------
             Tensor
         """
-        self._attrs["inputs"] = [x, cu_seqlens]
+        self._attrs["inputs"] = [x] if cu_seqlens is None else [x, cu_seqlens]
         self._set_depth()
-        self._extract_exec_path(x)
-        output_shape = self._infer_shapes(x, cu_seqlens)
-        output = Tensor(output_shape, src_ops={self})
+        xshape = x._attrs["shape"]
 
         batch_size = self._attrs["batch_size"]
         max_seq_len = self._attrs["max_seq_len"]
-        total = x._attrs["shape"][0]._attrs["values"][0]
-        num_heads = x._attrs["shape"][2]._attrs["values"][0]
-        head_size = x._attrs["shape"][3]._attrs["values"][0]
-        assert head_size in [8, 16, 32, 64, 128]
-        self._attrs["head_size"] = head_size
-
         base_N = 256  # SM80
         if max_seq_len <= 128:
             seq_len = 128
@@ -152,6 +146,46 @@ class flash_attention(Operator):
         else:
             seq_len = ((max_seq_len + base_N - 1) // base_N) * base_N
         self._attrs["seq_len"] = seq_len
+
+        if len(xshape) == 5:
+            # Dense 5D [B,S,3,H,D] path (cutedsl only). Keep B as the leading dim so
+            # the batch IntVar is shared with the rest of the graph -- collapsing to
+            # [B*S,3,H,D] introduces a derived `total` dim that pollutes AIT's
+            # dynamic-shape profiling (conv2d exec-path buckets come out wrong).
+            # Output is [B,S,H,D]; the wrapper writes B*S contiguous rows either way.
+            B, S = xshape[0], xshape[1]
+            num_heads = xshape[3]._attrs["values"][0]
+            head_size = xshape[4]._attrs["values"][0]
+            assert head_size in [8, 16, 32, 64, 128]
+            self._attrs["head_size"] = head_size
+            self._attrs["dense5d"] = True
+            # Set the cutedsl backend suffix HERE (per op instance), not only in
+            # gen_function: AIT dedups identical ops to one function so gen_function
+            # runs once, leaving deduped duplicates with backend_suffix="" -> they
+            # route to the base 4D func_call and read num_heads/head_size from the
+            # wrong (4D) shape indices, producing garbage. The 5D path is cutedsl-only.
+            self._attrs["backend_suffix"] = "_cutedsl"
+            total_max = B._attrs["values"][-1] * S._attrs["values"][-1]
+            self._attrs["workspace"] = (
+                4 * num_heads * (total_max * head_size + batch_size * seq_len)
+            )
+            output = Tensor([B, S, xshape[3], xshape[4]], src_ops={self})
+            self._attrs["outputs"] = [output]
+            return output
+
+        assert cu_seqlens is not None, (
+            "flash_attention: the packed 4D path needs cu_seqlens; only the dense 5D "
+            "cutedsl path may omit it."
+        )
+        self._extract_exec_path(x)
+        output_shape = self._infer_shapes(x, cu_seqlens)
+        output = Tensor(output_shape, src_ops={self})
+
+        total = xshape[0]._attrs["values"][0]
+        num_heads = xshape[2]._attrs["values"][0]
+        head_size = xshape[3]._attrs["values"][0]
+        assert head_size in [8, 16, 32, 64, 128]
+        self._attrs["head_size"] = head_size
 
         self._attrs["workspace"] = (
             4 * num_heads * (total * head_size + batch_size * seq_len)
