@@ -410,7 +410,11 @@ class conv2d(Operator):
                     co=self._attrs["CO"],
                     op_type=self._attrs["op"],
                     device=target._arch,
-                    epilogue=tmp_op.epilogue_functor.value,
+                    epilogue=(
+                tmp_op.epilogue_functor.value
+                if hasattr(tmp_op, "epilogue_functor")
+                else 0
+            ),
                     split_k=split_k,
                     exec_entry_sha1=exec_entry_sha1,
                     **self._get_params_factory(),
@@ -509,7 +513,11 @@ class conv2d(Operator):
             co=self._attrs["CO"],
             op_type=self._attrs["op"],
             device=target._arch,
-            epilogue=tmp_op.epilogue_functor.value,
+            epilogue=(
+                tmp_op.epilogue_functor.value
+                if hasattr(tmp_op, "epilogue_functor")
+                else 0
+            ),
             split_k=split_k,
             exec_entry_sha1=exec_entry_sha1,
             **self._get_params_factory(),
@@ -564,7 +572,11 @@ class conv2d(Operator):
             kw=self._attrs["KW"],
             co=self._attrs["CO"],
             op_type=self._attrs["op"],
-            epilogue=tmp_op.epilogue_functor.value,
+            epilogue=(
+                tmp_op.epilogue_functor.value
+                if hasattr(tmp_op, "epilogue_functor")
+                else 0
+            ),
             device=target._arch,
             algo=best_algo,
             workspace=workspace,

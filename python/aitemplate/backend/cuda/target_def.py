@@ -143,14 +143,22 @@ class CUDA(Target):
         return [level]
 
     def _build_nvcc_compiler_options(self) -> List[str]:
-        code = [f"sm_{self._arch}", f"compute_{self._arch}"]
+        # CUTLASS API 3.x SM90 TMA / WGMMA kernels are arch-conditional and abort at
+        # runtime unless compiled for the `sm_90a` target (not plain `sm_90`).
+        # Under AIT_FORCE_CUTLASS_SM90_KERNELS=1 we generate native SM90 3.x conv
+        # (and gemm) kernels, so the whole build must target 90a. Gated on the
+        # FORCE flag so FORCE=0 (sm_90) builds remain byte-identical.
+        nvcc_arch = self._arch
+        if nvcc_arch == "90" and environ.force_cutlass_sm90_kernels():
+            nvcc_arch = "90a"
+        code = [f"sm_{nvcc_arch}", f"compute_{nvcc_arch}"]
         if environ.enable_cuda_lto():
-            code += [f"lto_{self._arch}"]
+            code += [f"lto_{nvcc_arch}"]
         options = [
             "-t=0",
             "-DCUTLASS_ENABLE_TENSOR_CORE_MMA=1",
             "-w",
-            f"-gencode=arch=compute_{self._arch},code=[{','.join(code)}]",
+            f"-gencode=arch=compute_{nvcc_arch},code=[{','.join(code)}]",
             environ.get_compiler_opt_level(),
             "-std=c++17",
             "--expt-relaxed-constexpr",
