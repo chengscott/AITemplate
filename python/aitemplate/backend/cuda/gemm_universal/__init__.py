@@ -43,6 +43,7 @@ from aitemplate.backend.cuda.gemm_universal import (
     group_gemm_rcr_bias_relu,
     group_gemm_rcr_bias_sigmoid,
     nvte_gemm,
+    nvte_quantize,
     nvte_rmsnorm,
     perm021fc_ccr,
     perm021fc_ccr_bias,

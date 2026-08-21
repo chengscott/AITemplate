@@ -468,10 +468,9 @@ FUNC_CALL_TEMPLATE = jinja2.Template(
 
 
 # ---------------------------------------------------------------------------
-# CUTLASS API 3.x (SM90 / Hopper) native convolution host codegen. ("API 3.x/2.x"
-# = the CUTLASS programming-model generation, not the release -- vendored is 4.7.)
+# CUTLASS 3.x (SM90 / Hopper) native convolution host codegen.
 #
-# AIT's default conv host path (templates above) is 100% CUTLASS API 2.x: it wraps
+# AIT's default conv host path (templates above) is 100% CUTLASS 2.x: it wraps
 # the kernel in cutlass::conv::device::ImplicitGemmConvolution and builds the
 # SM80 positional Arguments. The templates below are a parallel host path for
 # ConvOperation3x (is_3x=True) ops: a ConvUniversalAdapter<ConvUniversal<...>>
@@ -674,10 +673,12 @@ EXEC_TEMPLATE_3X = jinja2.Template(
 {{indent}}      stride_D
 {{indent}}    }
 {{indent}}};
-{{indent}}// alpha scales the f32 accumulator (1 for a plain conv).
+{{indent}}// alpha descales the f32 accumulator. fp16 conv: alpha=1. fp8 conv: alpha =
+{{indent}}// act_scale_inv * w_scale_inv (per-tensor dequant) applied before bias/relu/add.
 {{indent}}arguments.epilogue.thread.alpha = {{alpha_expr}};
 {% if is_bias_add %}
-{{indent}}// beta scales the residual source C (1 for the residual add).
+{{indent}}// beta scales the residual source C. fp16 residual: beta=1. fp8 (full-fusion)
+{{indent}}// residual: beta = out_scale/residual_scale (dequant the E4M3 residual, requant).
 {{indent}}arguments.epilogue.thread.beta = {{beta_expr}};
 {% else %}
 {{indent}}arguments.epilogue.thread.beta = 0.0f;
@@ -773,7 +774,7 @@ int benchmark_{{function_name}} (
 def make_fusion_cpp(op, epilogue_name):
     """Select the SM90 fusion epilogue op (and residual flag) for a conv op.
 
-    Maps AIT's conv epilogue name to a CUTLASS API 3.x fusion operation. Bias is
+    Maps AIT's conv epilogue name to a CUTLASS 3.x fusion operation. Bias is
     per-output-channel = per-K = the implicit-gemm column dim -> PerCol. All
     three use fusion::LinCombPerColBiasEltAct, which computes
         D = activation(alpha*acc + beta*C + per-col bias)
@@ -792,7 +793,14 @@ def make_fusion_cpp(op, epilogue_name):
 
     elem_out = library.DataTypeTag[op.D.element]
     elem_compute = library.DataTypeTag[op.element_compute]
-    elem_bias = library.DataTypeTag[op.C.element]
+    # Bias element: normally = C (source) element. But under FULL fp8 fusion the source C
+    # is the E4M3 residual, while the per-channel bias must stay f16 for precision -- the
+    # fusion op takes a SEPARATE ElementBias, so decouple them: bias is f16 whenever C is
+    # e4m3. (The epilogue's source-C element is op.C.element, set independently.)
+    if op.C.element == library.DataType.e4m3:
+        elem_bias = library.DataTypeTag[library.DataType.f16]
+    else:
+        elem_bias = library.DataTypeTag[op.C.element]
 
     def _fusion(act):
         return (
@@ -812,7 +820,7 @@ def make_fusion_cpp(op, epilogue_name):
 
 
 def emit_instance_3x(op):
-    """Emit a CUTLASS API 3.x (SM90) conv instance with a fused epilogue.
+    """Emit a CUTLASS 3.x (SM90) conv instance with a fused epilogue.
 
     Mirrors cutlass_library.conv3x_emitter.EmitConv3xInstance.emit (reusing its
     shape/schedule helpers), but injects op._ait_fusion_cpp as the epilogue
@@ -896,7 +904,7 @@ def emit_instance(op):
     """emit instance"""
     import cutlass_lib
 
-    # CUTLASS API 3.x (SM90) conv ops take a fully separate host path. Check this
+    # CUTLASS 3.x (SM90) conv ops take a fully separate host path. Check this
     # first: extract_config may set .binary_op on a 3x op (for residual epilogue
     # bookkeeping), which must NOT route it to the 2.x WithBroadcast emitter.
     if getattr(op, "is_3x", False):
@@ -925,25 +933,45 @@ def extract_config(
 
     spec = CUDASpec()
 
-    lib_dtype = spec.dtype_to_lib_type(dtype)
-    if lib_dtype == "float":
-        data_type = cutlass_lib.library.DataType.f32
-        acc_type = cutlass_lib.library.DataType.f32
-    elif "half" in lib_dtype:
-        data_type = cutlass_lib.library.DataType.f16
-        acc_type = cutlass_lib.library.DataType.f32
-        # check target use fp16 acc
-        if "use_fp16_acc" in Target.current()._kwargs:
-            if Target.current()._kwargs["use_fp16_acc"]:
-                acc_type = cutlass_lib.library.DataType.f16
-    elif "bfloat16" in lib_dtype:
-        data_type = cutlass_lib.library.DataType.bf16
+    # fp8 (E4M3) SM90 3.x conv: A/B are e4m3, C (bias/residual) stays f16, D (output) is
+    # f16 by default OR e4m3 when the conv fuses its output into the next conv (producer-
+    # epilogue fusion). `ab_type` is the operand element; `c_type`/`d_type` are C/D.
+    # d_type is read from the conv's OUTPUT tensor dtype (e4m3 -> fused). For every non-fp8
+    # dtype ab_type == c_type == d_type (the historical behavior).
+    if dtype == "float8_e4m3":
+        data_type = cutlass_lib.library.DataType.e4m3
+        ab_type = cutlass_lib.library.DataType.e4m3
+        # C is the epilogue source: for a bias_add (residual) conv it's the residual tensor
+        # (inputs[3]) -- e4m3 under full fusion, else f16; for bias/bias_relu there is no
+        # source so C is just the bias element (f16). D is the output tensor dtype.
+        _e4m3 = cutlass_lib.library.DataType.e4m3
+        _f16 = cutlass_lib.library.DataType.f16
+        _ins = func_attrs["inputs"]
+        res_dtype = _ins[3]._attrs["dtype"] if len(_ins) >= 4 else "float16"
+        c_type = _e4m3 if res_dtype == "float8_e4m3" else _f16
+        out_dtype = func_attrs["outputs"][0]._attrs["dtype"]
+        d_type = _e4m3 if out_dtype == "float8_e4m3" else _f16
         acc_type = cutlass_lib.library.DataType.f32
     else:
-        raise RuntimeError(f"Unsupported dtype {lib_dtype}")
-    ab_type = data_type
-    c_type = data_type
-    d_type = data_type
+        lib_dtype = spec.dtype_to_lib_type(dtype)
+        if lib_dtype == "float":
+            data_type = cutlass_lib.library.DataType.f32
+            acc_type = cutlass_lib.library.DataType.f32
+        elif "half" in lib_dtype:
+            data_type = cutlass_lib.library.DataType.f16
+            acc_type = cutlass_lib.library.DataType.f32
+            # check target use fp16 acc
+            if "use_fp16_acc" in Target.current()._kwargs:
+                if Target.current()._kwargs["use_fp16_acc"]:
+                    acc_type = cutlass_lib.library.DataType.f16
+        elif "bfloat16" in lib_dtype:
+            data_type = cutlass_lib.library.DataType.bf16
+            acc_type = cutlass_lib.library.DataType.f32
+        else:
+            raise RuntimeError(f"Unsupported dtype {lib_dtype}")
+        ab_type = data_type
+        c_type = data_type
+        d_type = data_type
 
     def f_proc_op(op):
         ret = []
@@ -954,7 +982,7 @@ def extract_config(
         ):
             return ret
 
-        # CUTLASS API 3.x conv ops (ConvOperation3x, is_3x=True) are Hopper (SM90) kernels
+        # CUTLASS 3.x conv ops (ConvOperation3x, is_3x=True) are Hopper (SM90) kernels
         # that carry a different attribute set than the SM80 Conv2dOperation. In
         # particular they have no `iterator_algorithm` (that is an SM80-only concept)
         # and they select the epilogue via epilogue_schedule/kernel_schedule rather
@@ -962,15 +990,15 @@ def extract_config(
         # the op version, mirroring how the gemm path keys off GemmKind.Universal3x.
         is_3x = getattr(op, "is_3x", False)
 
-        # CUTLASS API 3.x (SM90 / Hopper) native conv path. These ConvOperation3x ops
+        # CUTLASS 3.x (SM90 / Hopper) native conv path. These ConvOperation3x ops
         # carry no iterator_algorithm/epilogue_functor; the fused epilogue is
         # hand-authored (see emit_instance_3x / make_fusion_cpp) from the AIT
         # epilogue name. Only the TMA warp-specialized align-8 f16 kernels are
         # realizable, so we keep the op's native alignment (8) rather than
         # expanding low-alignment variants that would not compile.
         if is_3x:
-            # ConvOperation3x: match the op's A/B/C/D element types (all == data_type
-            # for a given precision) and its accumulator against the requested config.
+            # fp8: A/B == e4m3, C == f16, D == e4m3 (fused) or f16. f16/bf16/f32:
+            # ab_type == c_type == d_type so this is the original all-equal check.
             if not (
                 op.A.element == ab_type
                 and op.B.element == ab_type
@@ -1037,6 +1065,30 @@ def extract_config(
     return conv_ops
 
 
+def _op_a_is_e4m3(op):
+    """True if this (3x) conv op's A operand is E4M3 (i.e. an fp8 conv op)."""
+    try:
+        from cutlass_lib import library
+
+        return getattr(op, "is_3x", False) and op.A.element == library.DataType.e4m3
+    except Exception:
+        return False
+
+
+def _conv_lib_dtype(backend_spec, dtype):
+    """Map an AIT dtype to its cutlass element type for conv codegen.
+
+    CUDASpec.dtype_to_lib_type has no float8_e4m3 entry (it would raise). The
+    SM90 3.x conv exec/emit path no longer uses this scalar dtype for fp8 (each
+    pointer is cast to its instance's own ElementA/B/C/D), but the string is
+    still threaded for the 2.x path and profiler, so return the cutlass fp8 type
+    rather than crashing.
+    """
+    if dtype == "float8_e4m3":
+        return "cutlass::float_e4m3_t"
+    return backend_spec.dtype_to_lib_type(dtype)
+
+
 def gen_profiler(
     func_attrs,
     workdir,
@@ -1055,7 +1107,7 @@ def gen_profiler(
     op_instance = func_attrs["op_instance"]
 
     backend_spec = CUDASpec()
-    dtype = backend_spec.dtype_to_lib_type(func_attrs["inputs"][0]._attrs["dtype"])
+    dtype = _conv_lib_dtype(backend_spec, func_attrs["inputs"][0]._attrs["dtype"])
 
     func_call_extra_args = {}
     if is_bias:
@@ -1080,6 +1132,7 @@ def gen_profiler(
 
         if is_3x:
             config_name = op.procedural_name() + "_base"
+            _op_is_fp8 = _op_a_is_e4m3(op)
             exec_program = EXEC_TEMPLATE_3X.render(
                 indent="  ",
                 is_profiler=True,
@@ -1087,10 +1140,14 @@ def gen_profiler(
                 is_bias_add=is_bias_add,
                 instance_name=instance_name,
                 dtype=dtype,
-                # Profiler only measures latency, so alpha/beta are baked to 1.0.
+                # Profiler only measures latency; descale (alpha)/beta are irrelevant to
+                # timing, so bake 1.0 regardless of fp8/f16.
                 alpha_expr="1.0f",
                 beta_expr="1.0f",
-                bias_elem=f"{instance_name}_ElemC",
+                # fp8 fusion decouples the per-channel bias to f16 (ElementBias); cast to
+                # half so the arg type matches (bias_ptr is void*, so this is safe even
+                # though the profiler's dummy bias tensor is E4M3 -- timing only).
+                bias_elem=("cutlass::half_t" if _op_is_fp8 else f"{instance_name}_ElemC"),
             )
             instance = INSTANCE_TEMPLATE_3X.render(
                 config_name=config_name,
@@ -1309,12 +1366,26 @@ def gen_function(
 
     backend_spec = CUDASpec()
     in_dtype = func_attrs["inputs"][0]._attrs["dtype"]
-    dtype = backend_spec.dtype_to_lib_type(in_dtype)
-    # SM90 3.x conv epilogue: alpha scales the accumulator, beta the residual source;
-    # both 1.0 for a plain conv. bias_elem=None -> the instance's own ElemC below.
-    alpha_expr = "1.0f"
-    beta_expr = "1.0f"
-    bias_elem = None
+    dtype = _conv_lib_dtype(backend_spec, in_dtype)
+    # fp8 conv: the accumulator must be descaled by act_scale_inv * w_scale_inv
+    # (per-tensor dequant) in the epilogue before bias/relu/residual. That scalar
+    # is baked as an epilogue alpha literal from func_attrs["fp8_descale"], which
+    # the driver sets from per-conv calibration (act amax) and the quantized
+    # weight's |W|max. fp16 conv keeps alpha=1.0f.
+    is_fp8_conv = in_dtype == "float8_e4m3"
+    if is_fp8_conv:
+        _descale = float(func_attrs.get("fp8_descale", 1.0))
+        alpha_expr = f"{_descale!r}f"
+        # beta scales the residual source. fp16 residual (partial fusion / conv5) -> 1.
+        # full-fusion E4M3 residual -> out_scale/residual_scale (func_attrs["fp8_res_beta"]).
+        _beta = float(func_attrs.get("fp8_res_beta", 1.0))
+        beta_expr = f"{_beta!r}f"
+        # fp8 bias is decoupled to f16 (ElementBias) in make_fusion_cpp.
+        bias_elem = "cutlass::half_t"
+    else:
+        alpha_expr = "1.0f"
+        beta_expr = "1.0f"
+        bias_elem = None  # -> per-instance ElemC below
     shape_eval_func = shape_eval_template.render(
         indent="  ",
         dtype="int64_t ",

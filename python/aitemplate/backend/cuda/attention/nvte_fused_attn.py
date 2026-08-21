@@ -1,5 +1,8 @@
 #  Backend codegen for nvte_fused_attn: wraps TransformerEngine's nvte_fused_attn_fwd
 #  (BSHD, no-mask, fp16 inference) with its two-pass workspace + aux-tensor-pack query.
+#  FP8 (H200) TODO: Q/K/V -> kFloat8E4M3 with descale scales, pick the NVTE_FP8 backend
+#  (nvte_get_fused_attn_backend, q_dtype=kFloat8E4M3); at head_dim=16 verify cuDNN FP8
+#  attn is supported, else keep attention fp16 and FP8 only the gemms. docs/te_fp8_handoff.md.
 #  All scratch (cu_seqlens, rng, softmax-stats aux, nvte workspace) is carved out of
 #  global_workspace_ at fixed max offsets; cu_seqlens = [0,S,..,B*S] filled by a kernel.
 import jinja2

@@ -32,6 +32,11 @@ def get_alignments(dtype: str) -> List[int]:
         return [8, 4, 2, 1]
     elif dtype in ("float", "float32"):
         return [4, 2, 1]
+    elif dtype == "float8_e4m3":
+        # 1 byte/elem: 16-elem alignment == 16 bytes (the Hopper TMA requirement
+        # for fp8 conv/gemm operands). Used to size A/B alignment for the SM90 3.x
+        # fp8 conv path (see backend/cuda/conv2d/common.py).
+        return [16, 8, 4, 2, 1]
     else:
         raise NotImplementedError(f"unsupported {dtype=} for alignments")
 
@@ -70,5 +75,10 @@ def valid_alignment(align: int, dtype: str) -> bool:
         return align % 2 == 0
     elif dtype in ("float", "float32"):
         return True
+    elif dtype == "float8_e4m3":
+        # fp8 Hopper TMA wants 16-byte (=16-elem) alignment; a shorter last dim is
+        # padded up to the next 16 (apply_padding). All trunk conv channel counts
+        # (128/256) are already 16-aligned, so this pads nothing in practice.
+        return align % 16 == 0
     else:
         raise NotImplementedError(f"unsupported {dtype=} for valid_alignment")

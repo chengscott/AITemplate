@@ -36,6 +36,10 @@ def types_mapping():
     yield (int32, "int32")
     yield (int64, "int64")
     yield (bool, "bool")
+    # FP8 E4M3 (torch.float8_e4m3fn) -> AIT float8_e4m3, so set_many_constants_with_tensors
+    # accepts the fp8 nvte weights. Guarded: older torch may lack the dtype.
+    if hasattr(torch, "float8_e4m3fn"):
+        yield (torch.float8_e4m3fn, "float8_e4m3")
 
 
 def torch_dtype_to_string(dtype):

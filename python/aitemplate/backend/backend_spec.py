@@ -58,6 +58,8 @@ class GPUBackendSpec(BackendSpec):
             "int64": "int64_t",
             "int32": "int32_t",
             "bool": "bool",
+            # FP8 E4M3: opaque 1-byte to AIT (uint8_t); nvte kernels do the fp8 math.
+            "float8_e4m3": "uint8_t",
         }
     )
 

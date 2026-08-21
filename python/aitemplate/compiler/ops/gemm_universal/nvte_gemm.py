@@ -19,11 +19,15 @@ _WORKSPACE_BYTES = 32 * 1024 * 1024
 class nvte_gemm(Operator):
     """Y = X @ W^T using TransformerEngine's nvte_cublas_gemm."""
 
-    def __init__(self) -> None:
+    def __init__(self, fp8=False) -> None:
         super().__init__()
         self._attrs["op"] = "nvte_gemm"
         self._attrs["has_profiler"] = False
         self._attrs["workspace"] = _WORKSPACE_BYTES
+        # fp8: A (weight) and B (activation) are E4M3 with baked per-tensor scale_inv,
+        # split-accumulator on; D stays fp16. Static per-tensor scaling (scales are
+        # constants) -> no runtime amax bookkeeping. See docs/te_fp8_impl_plan.md.
+        self._attrs["fp8"] = bool(fp8)
 
     def _infer_shapes(self, x: Tensor, w: Tensor):
         x_shape = x._attrs["shape"]
@@ -35,18 +39,30 @@ class nvte_gemm(Operator):
         ), "nvte_gemm: X last dim (K) must match W dim1 (K)"
         return list(x_shape[:-1]) + [w_shape[0]]
 
-    def __call__(self, x: Tensor, w: Tensor) -> Tensor:
-        """x: [..., K] activations, w: [N, K] weight. Returns [..., N]."""
-        self._attrs["inputs"] = [x, w]
+    def __call__(
+        self, x: Tensor, w: Tensor, act_scale_inv=None, w_scale_inv=None
+    ) -> Tensor:
+        """x: [..., K] activations, w: [N, K] weight. Returns [..., N].
+
+        fp8: x is a float8_e4m3 (1-byte) tensor, w is float8_e4m3, and act_scale_inv /
+        w_scale_inv are 1-elem fp32 constants that descale the gemm. The output is fp16.
+        """
+        if self._attrs["fp8"]:
+            assert (
+                act_scale_inv is not None and w_scale_inv is not None
+            ), "nvte_gemm(fp8=True) needs act_scale_inv and w_scale_inv"
+            self._attrs["inputs"] = [x, w, act_scale_inv, w_scale_inv]
+        else:
+            self._attrs["inputs"] = [x, w]
         self._set_depth()
-        output = Tensor(
-            self._infer_shapes(x, w), src_ops={self}, dtype=x._attrs["dtype"]
-        )
+        # fp8 activation carries a 1-byte dtype; force the gemm output back to fp16.
+        out_dtype = "float16" if self._attrs["fp8"] else x._attrs["dtype"]
+        output = Tensor(self._infer_shapes(x, w), src_ops={self}, dtype=out_dtype)
         self._attrs["outputs"] = [output]
         return output
 
     def _get_op_attributes(self):
-        return {}
+        return {"fp8": self._attrs["fp8"]}
 
     def gen_function(self) -> str:
         target = backend.target.Target.current()

@@ -25,6 +25,9 @@ _DTYPE2BYTE = {
     "int32": 4,
     "int64": 8,
     "bfloat16": 2,
+    # FP8 E4M3 (1 byte): opaque to AIT (no AIT-side arithmetic); the TransformerEngine
+    # nvte fp8 gemm/rmsnorm kernels do the fp8 math. See docs/te_fp8_impl_plan.md.
+    "float8_e4m3": 1,
 }
 
 
@@ -42,6 +45,7 @@ _DTYPE_TO_ENUM = {
     "int64": 4,
     "bool": 5,
     "bfloat16": 6,
+    "float8_e4m3": 7,
 }
 
 
@@ -133,6 +137,8 @@ def dtype_to_enumerator(dtype: str) -> str:
             return "kBool"
         elif dtype == "bfloat16":
             return "kBFloat16"
+        elif dtype == "float8_e4m3":
+            return "kFloat8E4M3"
         else:
             raise AssertionError(f"unknown dtype {dtype}")
 

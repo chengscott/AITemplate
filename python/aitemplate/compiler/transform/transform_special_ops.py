@@ -197,6 +197,14 @@ def _transform_1x1_conv_gemm_rcr(sorted_graph: List[Tensor]) -> List[Tensor]:
         if src_op._attrs["op"] not in conv_to_gemm:
             return False
 
+        # fp8 (E4M3) convs must NOT be lowered to gemm_rcr: the cutlass gemm path
+        # has no E4M3 host codegen (that lives in the fp8 nvte gemm path). Keep them
+        # as conv2d so they use the native SM90 3.x fp8 conv path
+        # (backend/cuda/conv2d/common.py). 1x1 fp8 convs run fine there (degenerate
+        # im2col). fp16 convs are unaffected -> byte-identical.
+        if src_op._attrs["inputs"][0]._attrs["dtype"] == "float8_e4m3":
+            return False
+
         valid_pad = src_op._attrs["pad"] == 0 or src_op._attrs["pad"] == (0, 0)
         valid_dilate = src_op._attrs["dilate"] == 1 or src_op._attrs["dilate"] == (1, 1)
         valid_stride = src_op._attrs["stride"] == 1 or src_op._attrs["stride"] == (1, 1)

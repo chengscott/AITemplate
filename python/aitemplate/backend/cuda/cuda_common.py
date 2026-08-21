@@ -23,6 +23,10 @@ DTYPE_TO_CUDATYPE: Dict[str, str] = {
     "float32": "float",
     "float": "float",
     "int64": "int64_t",
+    # FP8 E4M3 buffers are opaque 1-byte to AIT (declared/copied as uint8_t); the nvte
+    # fp8 kernels reinterpret the bytes as E4M3. Avoids needing <cuda_fp8.h> in every
+    # generated TU. See docs/te_fp8_impl_plan.md.
+    "float8_e4m3": "uint8_t",
 }
 
 

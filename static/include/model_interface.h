@@ -72,6 +72,9 @@ enum class AITemplateDtype {
   kLong,
   kBool,
   kBFloat16,
+  // FP8 E4M3 (1 byte). Opaque 1-byte element for TransformerEngine nvte fp8 tensors;
+  // must stay LAST to keep the enum values (kept in sync with dtype.py _DTYPE_TO_ENUM).
+  kFloat8E4M3,
 };
 
 struct AITData {
@@ -100,6 +103,7 @@ inline size_t AITemplateDtypeSizeBytes(AITemplateDtype dtype) {
     case AITemplateDtype::kLong:
       return 8;
     case AITemplateDtype::kBool:
+    case AITemplateDtype::kFloat8E4M3:
       return 1;
     case AITemplateDtype::kUnset:
       throw std::runtime_error("Unset dtype has no size!");
