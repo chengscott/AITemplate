@@ -79,10 +79,12 @@ PROBLEM_ARGS_TEMPLATE_CUTLASS_3X = jinja2.Template(
         static_cast<coord_t>(K),
         static_cast<coord_t>(1)
     },                                                           // ProblemShape problem_shape
+    {  // MainloopArguments mainloop (explicit brace: mma_promotion_interval defaults)
     ({{elem_input_type}}*)(a_ptr) + input_a_offset,              // ElementA const* ptr_A
     {input_a_stride, cute::Int<1>{}, cute::Int<0>{}},            // StrideA dA
     ({{elem_input_type}}*)(b_ptr) + input_b_offset,              // ElementB const* ptr_B
     {input_b_stride, cute::Int<1>{}, cute::Int<0>{}},            // StrideB dB
+    },
     {
         {ElementComputeEpilogue(1), ElementComputeEpilogue(0)},  // typename ThreadEpilogueOp::Params thread
         nullptr,                                                 // ElementC const* ptr_C
@@ -130,10 +132,12 @@ PROFILER_PROBLEM_ARGS_TEMPLATE_CUTLASS_3X = jinja2.Template(
         static_cast<coord_t>(K),
         static_cast<coord_t>(1)
     },                                                           // ProblemShape problem_shape
+    {  // MainloopArguments mainloop (explicit brace: mma_promotion_interval defaults)
     ({{elem_input_type}}*)(a_ptr),                               // ElementA const* ptr_A
     {K, cute::Int<1>{}, cute::Int<0>{}},                         // StrideA dA
     ({{elem_input_type}}*)(b_ptr),                               // ElementB const* ptr_B
     {K, cute::Int<1>{}, cute::Int<0>{}},                         // StrideB dB
+    },
     {
         {ElementComputeEpilogue(1), ElementComputeEpilogue(0)},  // typename ThreadEpilogueOp::Params thread
         nullptr,                                                 // ElementC const* ptr_C

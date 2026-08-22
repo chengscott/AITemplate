@@ -544,6 +544,14 @@ def extract_config(
         ):
             return ret
 
+        # SM90 (Universal3x) conv candidates -- generated when SM90 kernels are
+        # forced/allowed -- are ConvOperation3x, a TMA design with no
+        # iterator_algorithm attribute. AIT's conv profiler/emit here is built
+        # around the 2x "Optimized" iterator convs, so skip 3x conv ops rather
+        # than AttributeError on op.iterator_algorithm below.
+        if not hasattr(op, "iterator_algorithm"):
+            return ret
+
         if (
             op.A.element == data_type
             and op.B.element == data_type

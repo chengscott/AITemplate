@@ -67,6 +67,26 @@ def _aot_compile_cutedsl_kernel(output_dir, func_name, head_dim, is_causal, arch
     import cutlass
     import torch
 
+    # Compat shim: flash-attn's cute module (flash_attn/cute/flash_fwd.py) does
+    # `import cutlass.utils.ampere_helpers as sm80_utils_basic` and reads
+    # `SMEM_CAPACITY["sm80"]`. nvidia-cutlass-dsl 4.7.0 dropped that module (it
+    # keeps hopper_helpers/blackwell_helpers only). The symbol is used solely on
+    # FA4's SM80 path; we compile SM90 here, but flash_fwd imports it at module
+    # load, so provide a minimal stand-in before importing flash_attn.cute. The
+    # value mirrors cutlass_dsl SMEM_CAPACITY_MAP['sm_80'] (166912).
+    import sys as _sys
+
+    if "cutlass.utils.ampere_helpers" not in _sys.modules:
+        import types as _types
+
+        import cutlass.utils as _cu_utils
+
+        if not hasattr(_cu_utils, "ampere_helpers"):
+            _ah = _types.ModuleType("cutlass.utils.ampere_helpers")
+            _ah.SMEM_CAPACITY = {"sm80": 166912}
+            _sys.modules["cutlass.utils.ampere_helpers"] = _ah
+            _cu_utils.ampere_helpers = _ah
+
     if arch >= 90:
         from aitemplate.backend.cuda.attention.cutedsl_flash_attention_sm90 import (
             FlashAttentionFwdSm90Aot as _FlashAttentionFwdAot,

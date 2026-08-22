@@ -138,10 +138,12 @@ PROBLEM_ARGS_TEMPLATE_CUTLASS_3X = jinja2.Template(
         static_cast<coord_t>({{layout.k}}),
         static_cast<coord_t>(1)
     },                                                           // ProblemShape problem_shape
+    {  // MainloopArguments mainloop (explicit brace: mma_promotion_interval defaults)
     ({{elem_input_type}}*)(b_ptr) + input_b_offset,              // ElementA const* ptr_A
     {input_b_stride, cute::Int<1>{}, cute::Int<0>{}},            // StrideA dA
     ({{elem_input_type}}*)(a_ptr) + input_a_offset,              // ElementB const* ptr_B
     {input_a_stride, cute::Int<1>{}, cute::Int<0>{}},            // StrideB dB
+    },
     {
         {ElementComputeEpilogue(1), ElementComputeEpilogue(1)},  // typename ThreadEpilogueOp::Params thread
         {cute::Int<1>{}, {{layout.stride_c}}, cute::Int<0>{}},   // StrideC dC
@@ -214,10 +216,12 @@ PROFILER_PROBLEM_ARGS_TEMPLATE_CUTLASS_3X = jinja2.Template(
         static_cast<coord_t>({{layout.k}}),
         static_cast<coord_t>(1)
     },                                                           // ProblemShape problem_shape
+    {  // MainloopArguments mainloop (explicit brace: mma_promotion_interval defaults)
     ({{elem_input_type}}*)(b_ptr),                               // ElementB const* ptr_A
     { {{layout.stride_b}}, cute::Int<1>{}, cute::Int<0>{}},      // StrideB dA
     ({{elem_input_type}}*)(a_ptr),                               // ElementA const* ptr_B
     { {{layout.stride_a}}, cute::Int<1>{}, cute::Int<0>{}},      // StrideA dB
+    },
     {
         {ElementComputeEpilogue(1), ElementComputeEpilogue(1)},  // typename ThreadEpilogueOp::Params thread
         {cute::Int<1>{}, {{layout.stride_c}}, cute::Int<0>{}},   // StrideC dC
@@ -461,7 +465,23 @@ def _replace_epilogue_cutlass_3x(
     #     cutlass::epilogue::TmaWarpSpecialized
     # >::CollectiveOp;
 
-    CUTLASS_3X_EPILOGUE_NUM_LINES = 11
+    # The CollectiveBuilder header is a fixed 10-line prefix (indices 0..9):
+    #   0 using <name>_epilogue =
+    #   1 typename cutlass::epilogue::collective::CollectiveBuilder<
+    #   2 cutlass::arch::Sm90, cutlass::arch::OpClassTensorOp,
+    #   3 <tile shape>,
+    #   4 <cluster shape>,
+    #   5 cutlass::epilogue::collective::EpilogueTileAuto,
+    #   6 <element_accumulator>, <element_compute>,
+    #   7 <element_c>, <layout_c>, <align>,
+    #   8 <element_d>, <layout_d>, <align>,
+    #   9 <epilogue_schedule>
+    # cutlass v4.6.1 then appends an explicit fusion operation (e.g. a multi-line
+    # `cutlass::epilogue::fusion::LinearCombination<...>`) before the closing
+    # `>::CollectiveOp;`, so the block is no longer exactly 11 lines. Only the
+    # fixed prefix indices 0..9 are parsed here (and the whole block is replaced),
+    # so key off the actual collected length instead of a hardcoded 11.
+    CUTLASS_3X_EPILOGUE_PREFIX_LINES = 10
 
     lines = op_def.split("\n")
     stripped_lines = [line.strip() for line in lines]
@@ -479,10 +499,11 @@ def _replace_epilogue_cutlass_3x(
         raise ValueError(
             f"Generated epilogue not found in the CUTLASS 3.x op_def:\n\n{op_def}"
         )
-    if len(epilogue_lines) != CUTLASS_3X_EPILOGUE_NUM_LINES:
+    if len(epilogue_lines) < CUTLASS_3X_EPILOGUE_PREFIX_LINES + 1:
         raise ValueError(
-            "Generated CUTLASS 3.x epilogue must be 11 lines long, "
-            f"but got {CUTLASS_3X_EPILOGUE_NUM_LINES}:\n\n{op_def}"
+            f"Generated CUTLASS 3.x epilogue must be at least "
+            f"{CUTLASS_3X_EPILOGUE_PREFIX_LINES + 1} lines long, "
+            f"but got {len(epilogue_lines)}:\n\n{op_def}"
         )
 
     epilogue_name = epilogue_lines[0].split(" ")[1]
@@ -490,7 +511,9 @@ def _replace_epilogue_cutlass_3x(
     element_d, layout_d = epilogue_lines[8].split(", ")[:2]
     element_accumulator, element_compute = epilogue_lines[6].split(",")[:2]
     element_compute = element_compute.strip()
-    epilogue_schedule = epilogue_lines[9]
+    # v4.6.1 emits the schedule with a trailing comma (a fusion arg follows);
+    # the broadcast template appends `>>` after it, so drop any trailing comma.
+    epilogue_schedule = epilogue_lines[9].rstrip(",").strip()
 
     new_epilogue = EPILOGUE_TENSOR_BROADCAST_TEMPLATE.render(
         epilogue_name=epilogue_name,
@@ -509,7 +532,7 @@ def _replace_epilogue_cutlass_3x(
     )
 
     lines_before = lines[:epilogue_start]
-    lines_after = lines[epilogue_start + CUTLASS_3X_EPILOGUE_NUM_LINES :]
+    lines_after = lines[epilogue_start + len(epilogue_lines) :]
     new_lines = lines_before + [new_epilogue] + lines_after
     new_op_def = "\n".join(new_lines)
 
