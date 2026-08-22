@@ -143,11 +143,12 @@ class CUDA(Target):
         return [level]
 
     def _build_nvcc_compiler_options(self) -> List[str]:
-        # CUTLASS API 3.x SM90 TMA / WGMMA kernels are arch-conditional and abort at
-        # runtime unless compiled for the `sm_90a` target (not plain `sm_90`).
-        # Under AIT_FORCE_CUTLASS_SM90_KERNELS=1 we generate native SM90 3.x conv
-        # (and gemm) kernels, so the whole build must target 90a. Gated on the
-        # FORCE flag so FORCE=0 (sm_90) builds remain byte-identical.
+        # CUTLASS API 3.x SM90 TMA / WGMMA kernels (incl. all fp8 3x kernels) are
+        # arch-conditional and abort at runtime unless compiled for the `sm_90a`
+        # target (not plain `sm_90`). Under AIT_FORCE_CUTLASS_SM90_KERNELS=1 we
+        # generate native SM90 3.x conv / gemm / fp8 kernels, so the whole build
+        # must target 90a. Gated on the FORCE flag so FORCE=0 (sm_90) builds remain
+        # byte-identical.
         nvcc_arch = self._arch
         if nvcc_arch == "90" and environ.force_cutlass_sm90_kernels():
             nvcc_arch = "90a"

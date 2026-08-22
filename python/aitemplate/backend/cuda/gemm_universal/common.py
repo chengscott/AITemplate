@@ -28,6 +28,7 @@ from aitemplate.backend.backend_spec import CUDASpec
 from aitemplate.backend.common import gemm_common, tensor_accessor_codegen
 from aitemplate.backend.target import Target
 from aitemplate.compiler.base import IntImm
+from aitemplate.compiler.dtype import get_dtype_size
 from aitemplate.utils import alignment
 
 # pylint: disable=C0301,C0415,R1705
@@ -1103,9 +1104,20 @@ def gen_profiler(
     elem_output_type = backend_spec.dtype_to_lib_type(
         func_attrs["outputs"][0]._attrs["dtype"]
     )
-    elem_type = backend_spec.dtype_to_backend_type(
-        func_attrs["inputs"][0]._attrs["dtype"]
+    # The profiler's ProfilerMemoryPool is templated on a single element type used to
+    # size AND randomly-fill every A/B/C buffer. For a mixed-precision gemm (fp8 A/B ->
+    # f32 output) A/B and C differ, so pick the WIDER dtype: it over-allocates A/B
+    # (harmless -- the kernel reinterprets the pointers) but correctly sizes the f32
+    # output, and BlockFillRandomGaussian has no e4m3 overload while it does for f32/f16.
+    # For the uniform-dtype paths this is exactly the input dtype (unchanged).
+    in_dtype = func_attrs["inputs"][0]._attrs["dtype"]
+    out_dtype = func_attrs["outputs"][0]._attrs["dtype"]
+    pool_dtype = (
+        out_dtype
+        if get_dtype_size(out_dtype) > get_dtype_size(in_dtype)
+        else in_dtype
     )
+    elem_type = backend_spec.dtype_to_backend_type(pool_dtype)
     ndims = 2
     adims = ["&a_dim" + str(i) for i in range(ndims)]
     bdims = ["&b_dim" + str(i) for i in range(ndims)]
@@ -1294,7 +1306,15 @@ def gen_function_call(func_attrs, indent="  ", bias_ptr_arg=None):
 
 
 def default_fproc(
-    *, op, a_layout, b_layout, c_layout, dtype, epilogue_name, permute_layout=None
+    *,
+    op,
+    a_layout,
+    b_layout,
+    c_layout,
+    dtype,
+    epilogue_name,
+    permute_layout=None,
+    out_dtype=None,
 ):
     import copy
 
@@ -1310,6 +1330,10 @@ def default_fproc(
     ):
         return ret
     data_type = backend_spec.dtype_to_lib_type(dtype)
+    # fp8 (and any mixed-precision) gemm: A/B are the input dtype (e4m3) while
+    # C/D are a distinct, higher-precision output dtype (float32 here) accumulated
+    # in fp32. out_dtype defaults to dtype so the f16/bf16/f32 paths are unchanged.
+    out_data_type = backend_spec.dtype_to_lib_type(out_dtype or dtype)
     if data_type == "float":
         if (
             op.tile_description.math_instruction.element_a
@@ -1348,8 +1372,8 @@ def default_fproc(
     if (
         cutlass_lib.library.DataTypeTag[op.A.element] == data_type
         and cutlass_lib.library.DataTypeTag[op.B.element] == data_type
-        and cutlass_lib.library.DataTypeTag[op.C.element] == data_type
-        and cutlass_lib.library.DataTypeTag[op.D.element] == data_type
+        and cutlass_lib.library.DataTypeTag[op.C.element] == out_data_type
+        and cutlass_lib.library.DataTypeTag[op.D.element] == out_data_type
         and op.accumulator_type() == acc_type
         and op.A.layout == a_layout
         and op.B.layout == b_layout
@@ -1442,8 +1466,9 @@ def default_fproc(
                 permute_layout
             ]
 
-        # set C and D alignment
-        alignments = alignment.get_alignments(dtype)
+        # set C and D alignment (based on the OUTPUT dtype, which for fp8 gemm is
+        # the higher-precision f32 output, not the e4m3 A/B input dtype)
+        alignments = alignment.get_alignments(out_dtype or dtype)
         for i in alignments:
             if has_tma_epilogue(op) and i != max(alignments):
                 # TMA epilogues only support max. output alignment
@@ -1475,6 +1500,7 @@ def make_fproc(
             c_layout=c_layout,
             dtype=func_attrs["inputs"][0].dtype(),
             epilogue_name=func_attrs["epilogue"],
+            out_dtype=func_attrs["outputs"][0].dtype(),
         )
 
     func_attrs["op_instance"] = extract_config(

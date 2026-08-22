@@ -72,6 +72,7 @@ enum class AITemplateDtype {
   kLong,
   kBool,
   kBFloat16,
+  kFloat8E4M3,
 };
 
 struct AITData {
@@ -100,6 +101,8 @@ inline size_t AITemplateDtypeSizeBytes(AITemplateDtype dtype) {
     case AITemplateDtype::kLong:
       return 8;
     case AITemplateDtype::kBool:
+      return 1;
+    case AITemplateDtype::kFloat8E4M3:
       return 1;
     case AITemplateDtype::kUnset:
       throw std::runtime_error("Unset dtype has no size!");

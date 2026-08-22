@@ -235,8 +235,17 @@ class gemm(Operator):
         else:
             shape = epilogue_dim._attrs["values"][0]
 
-        dtype = self._attrs["inputs"][0].dtype()
+        # epilogue (C/D) alignment is a property of the OUTPUT tensor. For a
+        # mixed-precision gemm (fp8 A/B -> f32 output) this differs from the input
+        # dtype, so key it off _output_dtype() (== input dtype for the normal path).
+        dtype = self._output_dtype()
         self._attrs["epilogue_alignment"] = alignment.find_max_alignment(shape, dtype)
+
+    def _output_dtype(self) -> str:
+        """dtype of the gemm output tensor. Defaults to operand A's dtype; a
+        mixed-precision gemm (e.g. fp8 A/B accumulated to an f32 output) overrides
+        this so the output tensor / epilogue alignment use the wider dtype."""
+        return self._attrs["inputs"][0].dtype()
 
     def _infer_shapes(self, a: Tensor, b: Tensor):
         raise NotImplementedError("_infer_shapes() is not implemented!")
@@ -832,7 +841,7 @@ class gemm(Operator):
         self._sanity_check(a, b)
         output_shape = self._infer_shapes(a, b)
         self._extract_epilogue_alignment(output_shape)
-        output = Tensor(output_shape, src_ops={self}, dtype=a.dtype())
+        output = Tensor(output_shape, src_ops={self}, dtype=self._output_dtype())
         self._attrs["outputs"] = [output]
         self._attrs["output_accessors"] = [TensorAccessor(output)]
         return output

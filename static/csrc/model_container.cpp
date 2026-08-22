@@ -32,6 +32,8 @@ std::string GetEnumString(AITemplateDtype dtype) {
       return "kLong";
     case AITemplateDtype::kBFloat16:
       return "kBFloat16";
+    case AITemplateDtype::kFloat8E4M3:
+      return "kFloat8E4M3";
     default:
       return "unknown";
   }

@@ -36,6 +36,10 @@ def types_mapping():
     yield (int32, "int32")
     yield (int64, "int64")
     yield (bool, "bool")
+    # fp8: torch's e4m3 "fn" (finite, no inf) matches cutlass::float_e4m3_t.
+    fp8 = getattr(torch, "float8_e4m3fn", None)
+    if fp8 is not None:
+        yield (fp8, "float8_e4m3")
 
 
 def torch_dtype_to_string(dtype):

@@ -98,6 +98,18 @@ from aitemplate.compiler.ops.gemm_universal.rms_reduce import rms_reduce
 from aitemplate.compiler.ops.gemm_universal.rope2d import rope2d
 from aitemplate.compiler.ops.gemm_universal.swiglu import swiglu
 from aitemplate.compiler.ops.gemm_universal.unpack_rope import unpack_rope
+from aitemplate.compiler.ops.gemm_universal.gemm_rcr_fp8 import gemm_rcr_fp8
+from aitemplate.compiler.ops.gemm_universal.quantize_to_fp8 import quantize_to_fp8
+from aitemplate.compiler.ops.gemm_universal.dequant_fp8 import dequant_fp8
+from aitemplate.compiler.ops.gemm_universal.im2col_fp8 import im2col_fp8
+from aitemplate.compiler.ops.gemm_universal.conv2d_fp8 import conv2d_fp8
+from aitemplate.compiler.ops.gemm_universal.gemm_rcr_fp8_fused import gemm_rcr_fp8_fused
+from aitemplate.compiler.ops.gemm_universal.quantize_to_fp8_tensor import (
+    quantize_to_fp8_tensor,
+)
+from aitemplate.compiler.ops.gemm_universal.quantize_to_fp8_amax import (
+    quantize_to_fp8_amax,
+)
 from aitemplate.compiler.ops.gemm_universal.group_gemm_rcr import group_gemm_rcr
 from aitemplate.compiler.ops.gemm_universal.group_gemm_rcr_bias import (
     group_gemm_rcr_bias,
