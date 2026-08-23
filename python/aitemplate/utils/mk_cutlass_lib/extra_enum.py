@@ -183,13 +183,12 @@ class EpilogueScheduleType(enum.Enum):
   TmaWarpSpecializedCooperativeBiasElementwiseGELU = enum_auto()
   TmaWarpSpecializedBiasElementwiseFastGELU = enum_auto()
   TmaWarpSpecializedCooperativeBiasElementwiseFastGELU = enum_auto()
-  # cutlass v4.6.1 EpilogueScheduleType members (SM100/Blackwell + ptr-array/
-  # sparse schedules). This AIT enum SHADOWS cutlass's own EpilogueScheduleType,
-  # so cutlass's library helpers (e.g. is_tma_epilogue, exercised by the SM90
-  # Universal3x profiler emitter) resolve these names against this class. They
-  # are never emitted on sm_90 -- they only need to EXIST as members so those
-  # membership checks don't AttributeError. No EpilogueScheduleTag entries are
-  # added (the profiler picks only the tagged Tma schedules above on Hopper).
+  # cutlass v4.6.1 EpilogueScheduleType members (SM100/SM120/Nvf4/Mxf4/PtrArray/Sparse)
+  # NOT emitted by our SM90 fp16 gemm configs, but this enum SHADOWS cutlass's own (it
+  # is appended last into the generated library.py), so cutlass's copied code -- e.g.
+  # is_tma_epilogue()'s membership list -- must still resolve these names. Bare members
+  # (no Tag/Suffix entry): they exist only for those lookups; if one were ever actually
+  # emitted, the missing Tag key would raise loudly rather than pick a wrong kernel.
   PtrArrayNoSmemWarpSpecialized = enum_auto()
   NoSmemWarpSpecialized1Sm = enum_auto()
   NoSmemWarpSpecialized2Sm = enum_auto()
@@ -334,25 +333,6 @@ EpilogueScheduleBiasElementwiseMapping = {
   EpilogueScheduleType.TmaWarpSpecializedElementwiseFastGELU: EpilogueScheduleType.TmaWarpSpecializedBiasElementwiseFastGELU,
   EpilogueScheduleType.TmaWarpSpecializedCooperativeElementwiseFastGELU: EpilogueScheduleType.TmaWarpSpecializedCooperativeBiasElementwiseFastGELU,
 }
-
-# The base cutlass SM90 (Universal3x) instance emitter -- used only when the
-# profiler emits gemm candidates (EmitGemmUniversal3xInstance.emit) -- looks the
-# op's epilogue_functor up in EpilogueFunctor3xTag, which is keyed by cutlass's
-# own `EpilogueFunctor3x` enum. AIT builds its gemm profiler ops with the
-# extended `EpilogueFunctor` enum defined above (e.g. LinearCombination for
-# gemm_rcr_bias) -- a *different* enum class -- so that lookup KeyErrors on
-# Hopper (AIT_FORCE_CUTLASS_SM90_KERNELS). The 3x profiler only needs a trivial
-# epilogue ("3.0 profiler integration only supports trivial epilogues for now"),
-# so map every AIT EpilogueFunctor member onto the plain 3x LinearCombination
-# fusion for this codegen path. AIT's real fused kernels are emitted by its own
-# emitters (extra_operation) and never consult this table, so parity is
-# unaffected. Guarded so older cutlass without EpilogueFunctor3xTag is a no-op.
-try:
-  EpilogueFunctor3xTag.update(
-    {ef: 'cutlass::epilogue::fusion::LinearCombination' for ef in EpilogueFunctor}
-  )
-except NameError:
-  pass
 
 """
 )
