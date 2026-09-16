@@ -55,6 +55,7 @@ class FlashAttentionFwdSm80Aot:
         tile_m: int = 128,
         tile_n: int = 64,
         num_threads: int = 128,
+        seq_len: int = None,  # unused on SM80 (FA4 uses a fixed 128x64 tile here)
     ):
         self.softmax_scale = softmax_scale
         self.fa = FlashAttentionForwardSm80(

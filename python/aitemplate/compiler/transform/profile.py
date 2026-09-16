@@ -55,7 +55,7 @@ def profile(
     workdir="./tmp",
     devices=None,
     dynamic_profiling_strategy=DynamicProfileStrategy.MAX,
-    timeout=500,
+    timeout=int(os.environ.get("AIT_PROFILER_TIMEOUT", "500")),
 ):
     """Profiles kernels.
 

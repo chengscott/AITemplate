@@ -18,11 +18,14 @@ C = GeMM(A, B) + bias
 where A[RowMajor][M, K], B[ColMajor][N, K], bias[RowMajor][N]
 """
 
+import os
+
 import jinja2
 from aitemplate.backend import registry
 from aitemplate.backend.backend_spec import CUDASpec
 from aitemplate.backend.cuda.gemm_universal import common, common_bias, gemm_rcr
 from aitemplate.backend.cuda.gemm_universal.layout import RCR
+from aitemplate.backend.target import Target
 
 # pylint: disable=C0103,C0415,W0613,C0301,R1705,R1703
 
@@ -33,6 +36,36 @@ using elem_input_type = {{elem_input_type}};
 using elem_output_type = {{elem_output_type}};
 """
 )
+
+
+class _LinCombPerColBiasFunctor:
+    """SM100 (Blackwell) EVT epilogue fusion: D = alpha*acc + beta*C + per-column bias.
+
+    Emitted as the collective epilogue's fusion Operation for the CUTLASS 3.x SM100
+    path, where the SM90 ``TmaWarpSpecializedBiasElementwise`` schedule (bias-via-schedule)
+    does not exist -- SM100 fuses bias through the epilogue visitor tree instead. Set as
+    ``op.epilogue_functor`` so EmitGemmUniversal3xInstance emits it via ``emit_declaration``.
+    """
+
+    # Distinct sentinel used only as a profile-cache key field (like an enum's .value);
+    # kept clear of the real EpilogueFunctor enum's small integer values.
+    value = 10100
+
+    def __init__(
+        self, element_output, element_compute, element_bias, element_source, element_scalar
+    ):
+        self.element_output = element_output
+        self.element_compute = element_compute
+        self.element_bias = element_bias
+        self.element_source = element_source
+        self.element_scalar = element_scalar
+
+    def emit_declaration(self):
+        return (
+            "cutlass::epilogue::fusion::LinCombPerColBias<"
+            f"{self.element_output}, {self.element_compute}, {self.element_bias}, "
+            f"{self.element_source}, {self.element_scalar}>"
+        )
 
 
 # used for real execution
@@ -67,7 +100,36 @@ PROBLEM_ARGS_TEMPLATE = jinja2.Template(
 PROBLEM_ARGS_TEMPLATE_CUTLASS_3X = jinja2.Template(
     """
     cutlass::gemm::GemmUniversalMode::kGemm,                     // GemmUniversalMode mode
-{% if has_tma_epilogue %}
+{% if evt %}
+    {
+        static_cast<coord_t>(M),
+        static_cast<coord_t>(N),
+        static_cast<coord_t>(K),
+        static_cast<coord_t>(1)
+    },                                                           // ProblemShape problem_shape
+    {  // MainloopArguments mainloop (non-transposed; bias fused via EVT)
+    ({{elem_input_type}}*)(a_ptr) + input_a_offset,              // ElementA const* ptr_A
+    {input_a_stride, cute::Int<1>{}, cute::Int<0>{}},            // StrideA dA
+    ({{elem_input_type}}*)(b_ptr) + input_b_offset,              // ElementB const* ptr_B
+    {input_b_stride, cute::Int<1>{}, cute::Int<0>{}},            // StrideB dB
+    },
+    {  // EpilogueArguments (LinCombPerColBias: D = alpha*acc + beta*C + per-col bias)
+        {                                                        // thread (fusion args)
+            ElementComputeEpilogue(1),                           // alpha
+            ElementComputeEpilogue(0),                           // beta (no residual C)
+            nullptr,                                             // alpha_ptr
+            nullptr,                                             // beta_ptr
+            {cute::Int<0>{}, cute::Int<0>{}, int64_t(0)},        // StrideAlpha dAlpha
+            {cute::Int<0>{}, cute::Int<0>{}, int64_t(0)},        // StrideBeta dBeta
+            ({{elem_input_type}}*)(bias_ptr),                    // ElementBias const* bias_ptr
+            {cute::Int<0>{}, cute::Int<1>{}, int64_t(0)},        // StrideBias dBias (per-col)
+        },
+        nullptr,                                                 // ElementC const* ptr_C
+        {cute::Int<0>{}, cute::Int<1>{}, cute::Int<0>{}},        // StrideC dC
+        ({{elem_output_type}}*)(c_ptr) + output_offset,          // ElementD* ptr_D
+        {output_stride, cute::Int<1>{}, cute::Int<0>{}},         // StrideD dD
+    },                                                           // EpilogueArguments epilogue
+{% elif has_tma_epilogue %}
     {
         static_cast<coord_t>(N),
         static_cast<coord_t>(M),
@@ -145,7 +207,36 @@ PROFILER_PROBLEM_ARGS_TEMPLATE = jinja2.Template(
 PROFILER_PROBLEM_ARGS_TEMPLATE_CUTLASS_3X = jinja2.Template(
     """
     cutlass::gemm::GemmUniversalMode::kGemm,                     // GemmUniversalMode mode
-{% if has_tma_epilogue %}
+{% if evt %}
+    {
+        static_cast<coord_t>(M),
+        static_cast<coord_t>(N),
+        static_cast<coord_t>(K),
+        static_cast<coord_t>(1)
+    },                                                           // ProblemShape problem_shape
+    {  // MainloopArguments mainloop (non-transposed; bias fused via EVT)
+    ({{elem_input_type}}*)(a_ptr),                               // ElementA const* ptr_A
+    {K, cute::Int<1>{}, cute::Int<0>{}},                         // StrideA dA
+    ({{elem_input_type}}*)(b_ptr),                               // ElementB const* ptr_B
+    {K, cute::Int<1>{}, cute::Int<0>{}},                         // StrideB dB
+    },
+    {  // EpilogueArguments (LinCombPerColBias: D = alpha*acc + beta*C + per-col bias)
+        {                                                        // thread (fusion args)
+            ElementComputeEpilogue(1),                           // alpha
+            ElementComputeEpilogue(0),                           // beta (no residual C)
+            nullptr,                                             // alpha_ptr
+            nullptr,                                             // beta_ptr
+            {cute::Int<0>{}, cute::Int<0>{}, int64_t(0)},        // StrideAlpha dAlpha
+            {cute::Int<0>{}, cute::Int<0>{}, int64_t(0)},        // StrideBeta dBeta
+            ({{elem_input_type}}*)(bias_ptr),                    // ElementBias const* bias_ptr
+            {cute::Int<0>{}, cute::Int<1>{}, int64_t(0)},        // StrideBias dBias (per-col)
+        },
+        nullptr,                                                 // ElementC const* ptr_C
+        {cute::Int<0>{}, cute::Int<1>{}, cute::Int<0>{}},        // StrideC dC
+        ({{elem_output_type}}*)(c_ptr) + output_offset,          // ElementD* ptr_D
+        {output_stride, cute::Int<1>{}, cute::Int<0>{}},         // StrideD dD
+    },                                                           // EpilogueArguments epilogue
+{% elif has_tma_epilogue %}
     {
         static_cast<coord_t>(N),
         static_cast<coord_t>(M),
@@ -191,27 +282,44 @@ PROFILER_PROBLEM_ARGS_TEMPLATE_CUTLASS_3X = jinja2.Template(
 )
 
 
+def bias_use_evt():
+    """Fuse the CUTLASS 3.x TMA-epilogue bias through the EVT functor (LinCombPerColBias),
+    unified across SM90a and SM100. SM100 has no BiasElementwise schedule so it MUST use
+    EVT; SM90 also uses EVT by default (one mechanism, non-transposed problem). Set
+    AIT_SM90_BIAS_SCHEDULE=1 to fall back to the legacy SM90 bias-via-schedule path
+    (transposed problem) -- ignored on SM100 (no such schedule exists there)."""
+    if Target.current()._arch == "100":
+        return True
+    return os.environ.get("AIT_SM90_BIAS_SCHEDULE", "0") != "1"
+
+
 @registry.reg("cuda.gemm_rcr_bias.config")
 def gemm_rcr_config(func_attrs, dtype="float16"):
     common.make_fproc(func_attrs, RCR, include_cutlass_3x_ops=True)
 
     import cutlass_lib
 
+    lib = cutlass_lib.library
+    bias_map = lib.EpilogueScheduleBiasElementwiseMapping
+    evt = bias_use_evt()
     for op in func_attrs["op_instance"].values():
         if common.has_tma_epilogue(op):
-            # disable residual to leave more SMEM for the mainloop
-            op.C.element = cutlass_lib.library.DataType.void
-
-            # swap the output layout to the transposed problem
-            op.C.layout = cutlass_lib.library.LayoutType.ColumnMajor
-            op.D.layout = cutlass_lib.library.LayoutType.ColumnMajor
-
-            # switch to a TMA epilogue with bias
-            op.epilogue_schedule = (
-                cutlass_lib.library.EpilogueScheduleBiasElementwiseMapping[
-                    op.epilogue_schedule
-                ]
-            )
+            if evt:
+                # SM90a + SM100 unified: fuse the per-column bias via the EVT epilogue
+                # (LinCombPerColBias), non-transposed. PROBLEM_ARGS `evt` branch supplies args.
+                op.epilogue_functor = _LinCombPerColBiasFunctor(
+                    element_output=lib.DataTypeTag[op.D.element],
+                    element_compute=lib.DataTypeTag[op.element_epilogue],
+                    element_bias=lib.DataTypeTag[op.A.element],
+                    element_source=lib.DataTypeTag[op.A.element],
+                    element_scalar=lib.DataTypeTag[op.element_epilogue],
+                )
+                continue
+            # legacy SM90 bias-via-schedule (transposed problem):
+            op.C.element = lib.DataType.void
+            op.C.layout = lib.LayoutType.ColumnMajor
+            op.D.layout = lib.LayoutType.ColumnMajor
+            op.epilogue_schedule = bias_map[op.epilogue_schedule]
 
 
 @registry.reg("cuda.gemm_rcr_bias.gen_profiler")
@@ -268,6 +376,7 @@ def gen_function(
             common.has_tma_epilogue(func_attrs["op_instance"][exec_item.algo])
             for exec_item in func_attrs["exec_path"].values()
         ),
+        evt=bias_use_evt(),
     )
     extra_code = EXTRA_CODE.render(
         elem_input_type=elem_input_type,

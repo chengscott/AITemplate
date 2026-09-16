@@ -55,7 +55,7 @@ _LOGGER = logging.getLogger(__name__)
 # =============================================================================
 
 
-def _aot_compile_cutedsl_kernel(output_dir, func_name, head_dim, is_causal, arch):
+def _aot_compile_cutedsl_kernel(output_dir, func_name, head_dim, is_causal, arch, seq_len=None):
     """AOT-compile the FA4 forward for (head_dim, is_causal, arch); return (.h, .o).
 
     ``arch`` picks FA4's SM90 (Hopper) forward when >= 90, else the SM80 (Ampere)
@@ -87,7 +87,11 @@ def _aot_compile_cutedsl_kernel(output_dir, func_name, head_dim, is_causal, arch
             _sys.modules["cutlass.utils.ampere_helpers"] = _ah
             _cu_utils.ampere_helpers = _ah
 
-    if arch >= 90:
+    if arch >= 100:
+        from aitemplate.backend.cuda.attention.cutedsl_flash_attention_sm100 import (
+            FlashAttentionFwdSm100Aot as _FlashAttentionFwdAot,
+        )
+    elif arch >= 90:
         from aitemplate.backend.cuda.attention.cutedsl_flash_attention_sm90 import (
             FlashAttentionFwdSm90Aot as _FlashAttentionFwdAot,
         )
@@ -115,6 +119,7 @@ def _aot_compile_cutedsl_kernel(output_dir, func_name, head_dim, is_causal, arch
         softmax_scale=head_dim ** (-0.5),
         is_causal=is_causal,
         dtype=cutlass.Float16,
+        seq_len=seq_len,
     )
     cu_stream = cuda_drv.CUstream(torch.cuda.current_stream().cuda_stream)
 
@@ -269,6 +274,7 @@ def flash_attention_gen_function_cutedsl(func_attrs: Dict[str, Any]) -> str:
         head_dim=head_dim,
         is_causal=is_causal,
         arch=arch,
+        seq_len=func_attrs.get("max_seq_len") or func_attrs.get("seq_len"),
     )
     func_attrs["cutedsl_obj_path"] = o_path
 
@@ -477,6 +483,7 @@ def flash_attention_qkv_gen_function_cutedsl(func_attrs: Dict[str, Any]) -> str:
         head_dim=func_attrs["head_dim"],
         is_causal=bool(func_attrs["causal"]),
         arch=arch,
+        seq_len=func_attrs.get("seq_len"),
     )
     func_attrs["cutedsl_obj_path"] = o_path
     sig = FA4_QKV_SIGNATURE.render(func_name=func_name)

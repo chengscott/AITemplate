@@ -20,7 +20,7 @@ class rmsnorm(Operator):
         self._attrs["op"] = "rmsnorm"
         self._attrs["has_profiler"] = False
         self._attrs["eps"] = float(eps)
-        # fuse a relu on the output (RMSNorm -> relu, e.g. nbt norm_p/norm_q) so the relu
+        # fuse a relu on the output (RMSNorm -> relu) so the relu
         # isn't a separate elementwise kernel.
         self._attrs["relu"] = bool(relu)
 

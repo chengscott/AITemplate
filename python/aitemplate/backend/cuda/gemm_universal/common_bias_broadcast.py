@@ -238,6 +238,209 @@ PROFILER_PROBLEM_ARGS_TEMPLATE_CUTLASS_3X = jinja2.Template(
 """
 )
 
+# SM100 (Blackwell) residual/gate EVT. The single-source broadcast configs (binary_op2 is None,
+# so exactly one auxiliary tensor d0, carried through the epilogue C operand) map onto EVT:
+#   * add / add_relu -> the predefined LinCombPerColBias / LinCombPerColBiasEltAct<Act> functor
+#     (D = act(alpha*acc + beta*d0 + per-col bias), beta = 1).
+#   * mul -> D = (alpha*acc + per-col bias) * d0. No predefined functor, but the EVT *tree* is
+#     the LinCombPerColBias tree with the beta*C add swapped for a top multiplies(inner, C) node.
+#     We supply it via a custom FusionOperation tag + a Sm90 FusionCallbacks specialization
+#     (SM100 callbacks alias to the Sm90 ones, so one specialization covers both); the builder
+#     injects CtaTileShapeMNK, so the Sm90RowBroadcast bias node needs no hand-derived tile.
+# add_add / mul_add (binary_op2 set -> a *second* aux tensor d1) need an Sm90AuxLoad node, whose
+# TMA smem-layout-atom/stages template args the CollectiveBuilder derives internally and are very
+# fragile to hand-emit; those stay on the SM80 fallback.
+_UNSUPPORTED_SM100 = object()
+
+_IDENTITY = "cutlass::epilogue::thread::Identity"
+_RELU = "cutlass::epilogue::thread::ReLu"
+
+
+def _sm100_evt_kind(unary_op1, binary_op1, binary_op2, unary_op2):
+    """Classify a broadcast config into an SM100-EVT-supported kind, else _UNSUPPORTED_SM100.
+
+    Returns (kind, activation_tag): kind in {"add", "mul"}; activation_tag is the outer
+    activation tag (None, or e.g. ReLu) for the "add" flat-functor path.
+    """
+    if unary_op1 != _IDENTITY or binary_op2 is not None:
+        return _UNSUPPORTED_SM100  # inner activation / second aux tensor -> not single-source EVT
+    if binary_op1 == "cutlass::plus":
+        if unary_op2 == _IDENTITY:
+            return ("add", None)
+        if unary_op2 == _RELU:
+            return ("add", _RELU)
+        return _UNSUPPORTED_SM100
+    if binary_op1 == "cutlass::multiplies":
+        if unary_op2 == _IDENTITY:
+            return ("mul", None)
+        return _UNSUPPORTED_SM100  # mul_tanh / sigmoid_mul need extra unary nodes
+    return _UNSUPPORTED_SM100
+
+
+class _LinCombPerColBiasMulFunctor:
+    """SM100/SM90 EVT epilogue fusion: D = (alpha*acc + per-column bias) * C, with C = d0.
+
+    The multiply counterpart of gemm_rcr_bias._LinCombPerColBiasFunctor. There is no predefined
+    cutlass fusion Operation for it, so this emits a custom tag whose FusionCallbacks is defined
+    by SM100_MUL_EVT_HEADER (injected into the .cu). Runtime args are identical to plain
+    LinCombPerColBias (alpha, bias, ptr_C=d0), so the SM100 residual problem-args template is reused.
+    """
+
+    value = 10102  # profile-cache key sentinel
+
+    def __init__(
+        self, element_output, element_compute, element_bias, element_source, element_scalar
+    ):
+        self.element_output = element_output
+        self.element_compute = element_compute
+        self.element_bias = element_bias
+        self.element_source = element_source
+        self.element_scalar = element_scalar
+
+    def emit_declaration(self):
+        return (
+            "cutlass::epilogue::fusion::LinCombPerColBiasMul<"
+            f"{self.element_output}, {self.element_compute}, {self.element_bias}, "
+            f"{self.element_source}, {self.element_scalar}>"
+        )
+
+
+# Custom fusion op for gemm_rcr_bias_mul on SM100/SM90: the LinCombPerColBias EVT tree with the
+# top "beta*C + inner" multiply_add replaced by "inner * C" (C = d0, the gate/up tensor). Only a
+# Sm90 FusionCallbacks specialization is needed -- sm100_callbacks_tma_warpspecialized.hpp aliases
+# every Sm100TmaWarpSpecialized callback to its Sm90 counterpart. Include-guarded so it can be
+# prepended to each emitted instance safely.
+SM100_MUL_EVT_HEADER = """
+#ifndef AIT_LINCOMB_PERCOL_BIAS_MUL_DEFINED
+#define AIT_LINCOMB_PERCOL_BIAS_MUL_DEFINED
+namespace cutlass { namespace epilogue { namespace fusion {
+
+// FusionOperation tag (inherits LinCombPerColBias fields; builder treats it as tagged so it
+// injects CtaTileShapeMNK into the callbacks below).
+template<
+  class ElementOutput_,
+  class ElementCompute_,
+  class ElementBias_ = ElementOutput_,
+  class ElementSource_ = ElementOutput_,
+  class ElementScalar_ = ElementCompute_,
+  int AlignmentBias_ = 128 / cute::sizeof_bits_v<ElementBias_>,
+  FloatRoundStyle RoundStyle_ = FloatRoundStyle::round_to_nearest
+>
+struct LinCombPerColBiasMul
+    : LinCombPerColBias<ElementOutput_, ElementCompute_, ElementBias_, ElementSource_, ElementScalar_, AlignmentBias_, RoundStyle_> {};
+
+// EVT tree: (alpha*acc + per-col bias) * C
+template<
+  int StagesC, class CtaTileShapeMNK, class EpilogueTile,
+  class ElementOutput, class ElementCompute,
+  class ElementBias = ElementOutput, class ElementSource = ElementOutput,
+  class ElementScalar = ElementCompute,
+  int AlignmentBias = 128 / cute::sizeof_bits_v<ElementBias>,
+  FloatRoundStyle RoundStyle = FloatRoundStyle::round_to_nearest
+>
+using Sm90LinCombPerColBiasMul =
+  Sm90EVT<Sm90Compute<cutlass::multiplies, ElementOutput, ElementCompute, RoundStyle>, // inner * C
+    Sm90EVT<Sm90Compute<cutlass::homogeneous_multiply_add, ElementCompute, ElementCompute, RoundStyle>, // alpha*acc + bias
+      Sm90ScalarBroadcast<ElementScalar, cute::Stride<cute::_0,cute::_0,int64_t>>,
+      Sm90AccFetch,
+      Sm90RowBroadcast<0, CtaTileShapeMNK, ElementBias, ElementCompute, cute::Stride<cute::_0,cute::_1,int64_t>, AlignmentBias>
+    >,
+    Sm90SrcFetch<ElementSource> // C = d0
+  >;
+
+template <
+  int StagesC, int StagesD, int FragmentSize, bool ReuseSmemC, bool DelayTmaStore,
+  class ElementOutput, class ElementCompute, class ElementBias, class ElementSource, class ElementScalar,
+  int AlignmentBias, FloatRoundStyle RoundStyle, class CtaTileShapeMNK, class EpilogueTile
+>
+struct FusionCallbacks<
+    epilogue::Sm90TmaWarpSpecialized<StagesC, StagesD, FragmentSize, ReuseSmemC, DelayTmaStore>,
+    LinCombPerColBiasMul<ElementOutput, ElementCompute, ElementBias, ElementSource, ElementScalar, AlignmentBias, RoundStyle>,
+    CtaTileShapeMNK,
+    EpilogueTile
+> : Sm90LinCombPerColBiasMul<
+      StagesC, CtaTileShapeMNK, EpilogueTile, ElementOutput, ElementCompute, ElementBias, ElementSource, ElementScalar, AlignmentBias, RoundStyle> {
+  using Impl = Sm90LinCombPerColBiasMul<
+    StagesC, CtaTileShapeMNK, EpilogueTile, ElementOutput, ElementCompute, ElementBias, ElementSource, ElementScalar, AlignmentBias, RoundStyle>;
+  using Operation = LinCombPerColBiasMul<
+    ElementOutput, ElementCompute, ElementBias, ElementSource, ElementScalar, AlignmentBias, RoundStyle>;
+
+  struct Arguments {
+    ElementScalar alpha = ElementScalar(1);
+    ElementScalar beta = ElementScalar(0);
+    ElementScalar const* alpha_ptr = nullptr;
+    ElementScalar const* beta_ptr = nullptr;
+
+    using StrideAlpha = cute::Stride<cute::_0,cute::_0,int64_t>;
+    using StrideBeta  = cute::Stride<cute::_0,cute::_0,int64_t>;
+    StrideAlpha dAlpha = {cute::_0{}, cute::_0{}, 0};
+    StrideBeta  dBeta  = {cute::_0{}, cute::_0{}, 0};
+
+    using StrideBias = cute::Stride<cute::_0,cute::_1,int64_t>;
+    ElementBias const* bias_ptr = nullptr;
+    StrideBias dBias = {};
+
+    operator typename Impl::Arguments() const {
+      return
+        {                                          // multiplies : inner * C
+          {                                        // multiply_add : alpha*acc + bias
+            {{alpha}, {alpha_ptr}, {dAlpha}},      // leaf args : alpha
+            {},                                    // leaf args : acc
+            {bias_ptr, ElementBias(0), dBias},     // leaf args : bias
+            {}                                     // ternary args : multiply_add
+          },
+          {},                                      // leaf args : C (d0)
+          {}                                       // binary args : multiplies
+        };
+    }
+  };
+
+  using Impl::Impl;
+};
+
+}}}
+#endif  // AIT_LINCOMB_PERCOL_BIAS_MUL_DEFINED
+"""
+
+
+# SM100 non-transposed problem args for the residual-add EVT (LinCombPerColBias[EltAct]).
+# Same runtime args for add and add_relu (activation is compile-time in the functor); the
+# residual d0 is the source C (beta = 1), the per-col bias broadcasts down the columns.
+SM100_RESIDUAL_PROBLEM_ARGS_TEMPLATE_CUTLASS_3X = jinja2.Template(
+    """
+    cutlass::gemm::GemmUniversalMode::kGemm,                     // GemmUniversalMode mode
+    {
+        static_cast<coord_t>(M),
+        static_cast<coord_t>(N),
+        static_cast<coord_t>(K),
+        static_cast<coord_t>(1)
+    },                                                           // ProblemShape problem_shape
+    {  // MainloopArguments mainloop (non-transposed; bias+residual fused via EVT)
+    ({{elem_input_type}}*)(a_ptr),                              // ElementA const* ptr_A
+    {K, cute::Int<1>{}, cute::Int<0>{}},                        // StrideA dA
+    ({{elem_input_type}}*)(b_ptr),                              // ElementB const* ptr_B
+    {K, cute::Int<1>{}, cute::Int<0>{}},                        // StrideB dB
+    },
+    {  // EpilogueArguments (act(alpha*acc + beta*d0 + bias))
+        {                                                        // thread (fusion args)
+            ElementComputeEpilogue(1),                           // alpha
+            ElementComputeEpilogue(1),                           // beta (residual C = d0)
+            nullptr,                                             // alpha_ptr
+            nullptr,                                             // beta_ptr
+            {cute::Int<0>{}, cute::Int<0>{}, int64_t(0)},        // StrideAlpha dAlpha
+            {cute::Int<0>{}, cute::Int<0>{}, int64_t(0)},        // StrideBeta dBeta
+            ({{elem_input_type}}*)(bias_ptr),                    // ElementBias const* bias_ptr
+            {cute::Int<0>{}, cute::Int<1>{}, int64_t(0)},        // StrideBias dBias (per-col)
+        },
+        ({{elem_output_type}}*)(d0_ptr),                         // ElementC const* ptr_C (residual)
+        {output_stride, cute::Int<1>{}, cute::Int<0>{}},         // StrideC dC (row-major MxN)
+        ({{elem_output_type}}*)(c_ptr) + output_offset,          // ElementD* ptr_D
+        {output_stride, cute::Int<1>{}, cute::Int<0>{}},         // StrideD dD
+    },                                                           // EpilogueArguments epilogue
+"""
+)
+
+
 SRC_TEMPLATE = jinja2.Template(
     """
 #include <iostream>
@@ -550,10 +753,17 @@ def gemm_bias_broadcast_instance(
     unary_op2,
     elem_type,
     cutlass_3x=False,
+    sm100_evt=False,
+    sm100_mul_header="",
 ):
     """
     adjust gemm instance with respect to input_accessors, layout and epilogue ops
     """
+    if cutlass_3x and sm100_evt:
+        # SM100 EVT: op.epilogue_functor (LinCombPerColBias[EltAct] / LinCombPerColBiasMul) was
+        # already emitted by the collective builder; leave the instance as-is (no TensorBroadcast).
+        # For the mul kind, prepend the (include-guarded) FusionCallbacks header it needs.
+        return sm100_mul_header + op_def
     if cutlass_3x:
         return _replace_epilogue_cutlass_3x(
             op_def=op_def,
@@ -608,12 +818,59 @@ def gemm_bias_broadcast_instance(
     return res
 
 
-def gemm_bias_broadcast_config(func_attrs, layout, dtype="float16"):
+def gemm_bias_broadcast_config(
+    func_attrs,
+    layout,
+    dtype="float16",
+    unary_op1=None,
+    binary_op1=None,
+    binary_op2=None,
+    unary_op2=None,
+):
     common.make_fproc(
         func_attrs=func_attrs,
         layout=layout,
         include_cutlass_3x_ops=True,
     )
+    if Target.current()._arch != "100":
+        return
+    # SM100 (Blackwell): the CUTLASS 3.x TensorBroadcast epilogue uses an Sm90 adapter that
+    # doesn't apply here. Route the single-residual add / add_relu configs through the EVT
+    # LinCombPerColBias[EltAct] functor; drop every other config's 3.x ops to the SM80 fallback.
+    from aitemplate.backend.cuda.gemm_universal import (
+        common_bias_activation,
+        gemm_rcr_bias,
+    )
+
+    import cutlass_lib
+
+    lib = cutlass_lib.library
+    kind = _sm100_evt_kind(unary_op1, binary_op1, binary_op2, unary_op2)
+    drop = []
+    for name, op in func_attrs["op_instance"].items():
+        if not common.has_tma_epilogue(op):
+            continue  # SM80 2.x op: keep as fallback
+        if kind is _UNSUPPORTED_SM100:
+            drop.append(name)  # add_add / mul_add (2nd aux tensor) -> SM80 fallback
+            continue
+        kwargs = dict(
+            element_output=lib.DataTypeTag[op.D.element],
+            element_compute=lib.DataTypeTag[op.element_epilogue],
+            element_bias=lib.DataTypeTag[op.A.element],
+            element_source=lib.DataTypeTag[op.A.element],
+            element_scalar=lib.DataTypeTag[op.element_epilogue],
+        )
+        op_kind, activation = kind
+        if op_kind == "mul":
+            op.epilogue_functor = _LinCombPerColBiasMulFunctor(**kwargs)
+        elif activation is None:
+            op.epilogue_functor = gemm_rcr_bias._LinCombPerColBiasFunctor(**kwargs)
+        else:
+            op.epilogue_functor = common_bias_activation._LinCombPerColBiasEltActFunctor(
+                activation=activation, **kwargs
+            )
+    for name in drop:
+        del func_attrs["op_instance"][name]
 
 
 def gen_profiler(
@@ -645,6 +902,18 @@ def gen_profiler(
     )
     support_split_k = _support_split_k(func_attrs)
     has_d1 = common.has_d1(func_attrs)
+    _kind = (
+        _sm100_evt_kind(unary_op1, binary_op1, binary_op2, unary_op2)
+        if Target.current()._arch == "100"
+        else _UNSUPPORTED_SM100
+    )
+    sm100_evt = _kind is not _UNSUPPORTED_SM100
+    sm100_mul_header = SM100_MUL_EVT_HEADER if sm100_evt and _kind[0] == "mul" else ""
+    profiler_args_3x = (
+        SM100_RESIDUAL_PROBLEM_ARGS_TEMPLATE_CUTLASS_3X
+        if sm100_evt
+        else PROFILER_PROBLEM_ARGS_TEMPLATE_CUTLASS_3X
+    )
 
     ndims = 2
     adims = ["&a_dim" + str(i) for i in range(ndims)]
@@ -666,7 +935,7 @@ def gen_profiler(
             layout=layout,
             has_d1=has_d1,
         ),
-        problem_args_cutlass_3x=PROFILER_PROBLEM_ARGS_TEMPLATE_CUTLASS_3X.render(
+        problem_args_cutlass_3x=profiler_args_3x.render(
             elem_input_type=elem_input_type,
             elem_output_type=elem_output_type,
             layout=layout,
@@ -694,6 +963,8 @@ def gen_profiler(
                 binary_op2=binary_op2,
                 unary_op2=unary_op2,
                 elem_type=elem_input_type,
+                sm100_evt=sm100_evt,
+                sm100_mul_header=sm100_mul_header,
             ),
         )
         instance_name = f"{instance_name_base}_{instance_idx}"
@@ -812,6 +1083,13 @@ def gen_function(
     output_ndims = len(func_attrs["output_accessors"][0].original_shapes)
     support_split_k = _support_split_k(func_attrs)
     has_d1 = common.has_d1(func_attrs)
+    _kind = (
+        _sm100_evt_kind(unary_op1, binary_op1, binary_op2, unary_op2)
+        if Target.current()._arch == "100"
+        else _UNSUPPORTED_SM100
+    )
+    sm100_evt = _kind is not _UNSUPPORTED_SM100
+    sm100_mul_header = SM100_MUL_EVT_HEADER if sm100_evt and _kind[0] == "mul" else ""
     problem_args = PROBLEM_ARGS_TEMPLATE.render(
         elem_input_type=elem_input_type,
         elem_output_type=elem_output_type,
@@ -819,7 +1097,12 @@ def gen_function(
         support_split_k=support_split_k,
         has_d1=has_d1,
     )
-    problem_args_cutlass_3x = PROBLEM_ARGS_TEMPLATE_CUTLASS_3X.render(
+    args_3x_template = (
+        SM100_RESIDUAL_PROBLEM_ARGS_TEMPLATE_CUTLASS_3X
+        if sm100_evt
+        else PROBLEM_ARGS_TEMPLATE_CUTLASS_3X
+    )
+    problem_args_cutlass_3x = args_3x_template.render(
         elem_input_type=elem_input_type,
         elem_output_type=elem_output_type,
         layout=layout,
@@ -843,6 +1126,8 @@ def gen_function(
             binary_op2=binary_op2,
             unary_op2=unary_op2,
             elem_type=elem_input_type,
+            sm100_evt=sm100_evt,
+            sm100_mul_header=sm100_mul_header,
         ),
         support_split_k=support_split_k,
         input_addr_calculator=input_addr_calculator,

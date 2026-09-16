@@ -86,6 +86,7 @@ def gemm_rcr_config(func_attrs, dtype="float16"):
         func_attrs=func_attrs,
         dtype=dtype,
         include_cutlass_3x_ops=True,
+        activation_tag="cutlass::epilogue::thread::SiLu",
     )
 
 

@@ -94,7 +94,7 @@ FUNC_CALL_TEMPLATE = jinja2.Template(
 
 @registry.reg("cuda.rmsnorm.gen_function")
 def rmsnorm_gen_function(func_attrs):
-    # optional fused relu on the output (norm_p/norm_q -> relu -> gemm): folds the relu
+    # optional fused relu on the output (RMSNorm -> relu -> gemm): folds the relu
     # into the norm kernel so it isn't a standalone elementwise pass.
     relu_stmt = "a = fmaxf(a, 0.f); b = fmaxf(b, 0.f);" if func_attrs.get("relu") else ""
     return FUNC_TEMPLATE.render(func_name=func_attrs["name"], relu_stmt=relu_stmt)

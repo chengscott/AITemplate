@@ -121,7 +121,7 @@ FUNC_CALL_TEMPLATE = jinja2.Template(
 
 @registry.reg("cuda.rope2d.gen_function")
 def rope_gen_function(func_attrs):
-    # P==8 (head_dim=16, the go9/go19 deploy case) -> all-128-bit thread-per-head kernel;
+    # P==8 (head_dim=16) -> all-128-bit thread-per-head kernel;
     # any other P -> general scalar kernel.
     tmpl = VEC8_FUNC_TEMPLATE if func_attrs["p"] == 8 else SCALAR_FUNC_TEMPLATE
     return tmpl.render(

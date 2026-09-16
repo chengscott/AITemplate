@@ -76,6 +76,10 @@ class CUDA(Target):
                 cuda_version = "11.4.2"
             elif arch == "90":
                 cuda_version = "12.0.0"
+            elif arch == "100":
+                # Blackwell (sm_100) UMMA kernels need a recent toolkit; the
+                # cutlass_library SM100 generator version-gates its ops on this.
+                cuda_version = "13.0.0"
         self._cuda_version = cuda_version
 
     def _build_include_directories(self) -> List[str]:
@@ -151,6 +155,10 @@ class CUDA(Target):
         nvcc_arch = self._arch
         if nvcc_arch == "90" and environ.force_cutlass_sm90_kernels():
             nvcc_arch = "90a"
+        elif nvcc_arch == "100":
+            # CUTLASS SM100 (Blackwell) UMMA/tcgen05 kernels are arch-conditional
+            # and abort at launch unless compiled for sm_100a (like SM90 -> 90a).
+            nvcc_arch = "100a"
         code = [f"sm_{nvcc_arch}", f"compute_{nvcc_arch}"]
         if environ.enable_cuda_lto():
             code += [f"lto_{nvcc_arch}"]

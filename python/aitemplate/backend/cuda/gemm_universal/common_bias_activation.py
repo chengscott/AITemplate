@@ -21,8 +21,38 @@ import jinja2
 from aitemplate.backend.backend_spec import CUDASpec
 from aitemplate.backend.cuda.gemm_universal import common, common_bias, gemm_rcr
 from aitemplate.backend.cuda.gemm_universal.layout import RCR
+from aitemplate.backend.target import Target
 
 # pylint: disable=C0103,C0415,W0613,C0301,R1705,R1703
+
+
+class _LinCombPerColBiasEltActFunctor:
+    """SM100 EVT epilogue: D = act(alpha*acc + beta*C + per-column bias).
+
+    The activation counterpart of gemm_rcr_bias._LinCombPerColBiasFunctor -- emitted as
+    the collective epilogue's fusion Operation for the CUTLASS 3.x SM100 path (SM100 has
+    no BiasElementwise schedule). ``activation`` is the cutlass epilogue activation tag,
+    e.g. ``cutlass::epilogue::thread::ReLu``.
+    """
+
+    value = 10101  # profile-cache key sentinel (distinct from the plain-bias functor)
+
+    def __init__(
+        self, activation, element_output, element_compute, element_bias, element_source, element_scalar
+    ):
+        self.activation = activation
+        self.element_output = element_output
+        self.element_compute = element_compute
+        self.element_bias = element_bias
+        self.element_source = element_source
+        self.element_scalar = element_scalar
+
+    def emit_declaration(self):
+        return (
+            "cutlass::epilogue::fusion::LinCombPerColBiasEltAct<"
+            f"{self.activation}, {self.element_output}, {self.element_compute}, "
+            f"{self.element_bias}, {self.element_source}, {self.element_scalar}>"
+        )
 
 
 EXTRA_CODE_HEADER = jinja2.Template(
@@ -33,10 +63,50 @@ using elem_output_type = {{elem_output_type}};
 )
 
 
+# Shared SM100 (Blackwell) 3.x problem args for all bias+activation gemms: the
+# LinCombPerColBiasEltAct fusion Arguments (activation is compile-time in the functor,
+# so the runtime args are identical to plain LinCombPerColBias). Non-transposed problem;
+# per-column bias broadcast. Used for arch=="100" in place of each op's SM90 template.
+SM100_PROBLEM_ARGS_TEMPLATE_CUTLASS_3X = jinja2.Template(
+    """
+    cutlass::gemm::GemmUniversalMode::kGemm,                     // GemmUniversalMode mode
+    {
+        static_cast<coord_t>(M),
+        static_cast<coord_t>(N),
+        static_cast<coord_t>(K),
+        static_cast<coord_t>(1)
+    },                                                           // ProblemShape problem_shape
+    {  // MainloopArguments mainloop (non-transposed; bias+act fused via EVT)
+    ({{elem_input_type}}*)(a_ptr),                               // ElementA const* ptr_A
+    {K, cute::Int<1>{}, cute::Int<0>{}},                         // StrideA dA
+    ({{elem_input_type}}*)(b_ptr),                               // ElementB const* ptr_B
+    {K, cute::Int<1>{}, cute::Int<0>{}},                         // StrideB dB
+    },
+    {  // EpilogueArguments (LinCombPerColBiasEltAct<Act>: act(alpha*acc + beta*C + bias))
+        {                                                        // thread (fusion args)
+            ElementComputeEpilogue(1),                           // alpha
+            ElementComputeEpilogue(0),                           // beta (no residual C)
+            nullptr,                                             // alpha_ptr
+            nullptr,                                             // beta_ptr
+            {cute::Int<0>{}, cute::Int<0>{}, int64_t(0)},        // StrideAlpha dAlpha
+            {cute::Int<0>{}, cute::Int<0>{}, int64_t(0)},        // StrideBeta dBeta
+            ({{elem_input_type}}*)(bias_ptr),                    // ElementBias const* bias_ptr
+            {cute::Int<0>{}, cute::Int<1>{}, int64_t(0)},        // StrideBias dBias (per-col)
+        },
+        nullptr,                                                 // ElementC const* ptr_C
+        {cute::Int<0>{}, cute::Int<1>{}, cute::Int<0>{}},        // StrideC dC
+        ({{elem_output_type}}*)(c_ptr) + output_offset,          // ElementD* ptr_D
+        {output_stride, cute::Int<1>{}, cute::Int<0>{}},         // StrideD dD
+    },                                                           // EpilogueArguments epilogue
+"""
+)
+
+
 def gemm_rcr_config(
     func_attrs,
     dtype="float16",
     include_cutlass_3x_ops=False,
+    activation_tag=None,
 ):
     common.make_fproc(
         func_attrs=func_attrs,
@@ -46,21 +116,35 @@ def gemm_rcr_config(
 
     import cutlass_lib
 
-    for op in func_attrs["op_instance"].values():
+    lib = cutlass_lib.library
+    bias_map = lib.EpilogueScheduleBiasElementwiseMapping
+    evt = Target.current()._arch == "100"  # activation EVT: SM100 only (Sm90 relu FusionCallbacks::Arguments is nested/tuple, not the flat LinCombPerColBias form -- genuine cutlass mismatch, see gb200-sm100-port memory)
+    drop = []
+    for name, op in func_attrs["op_instance"].items():
         if common.has_tma_epilogue(op):
-            # disable residual to leave more SMEM for the mainloop
-            op.C.element = cutlass_lib.library.DataType.void
-
-            # swap the output layout to the transposed problem
-            op.C.layout = cutlass_lib.library.LayoutType.ColumnMajor
-            op.D.layout = cutlass_lib.library.LayoutType.ColumnMajor
-
-            # switch to a TMA epilogue with bias
-            op.epilogue_schedule = (
-                cutlass_lib.library.EpilogueScheduleBiasElementwiseMapping[
-                    op.epilogue_schedule
-                ]
-            )
+            if evt:
+                # SM90a + SM100: fuse bias+activation via the EVT epilogue
+                # (LinCombPerColBiasEltAct), non-transposed. Ops without a mapped activation
+                # (e.g. mul) drop -> SM80 fallback.
+                if activation_tag is not None:
+                    op.epilogue_functor = _LinCombPerColBiasEltActFunctor(
+                        activation=activation_tag,
+                        element_output=lib.DataTypeTag[op.D.element],
+                        element_compute=lib.DataTypeTag[op.element_epilogue],
+                        element_bias=lib.DataTypeTag[op.A.element],
+                        element_source=lib.DataTypeTag[op.A.element],
+                        element_scalar=lib.DataTypeTag[op.element_epilogue],
+                    )
+                else:
+                    drop.append(name)
+                continue
+            # legacy SM90 bias-via-schedule (transposed problem):
+            op.C.element = lib.DataType.void
+            op.C.layout = lib.LayoutType.ColumnMajor
+            op.D.layout = lib.LayoutType.ColumnMajor
+            op.epilogue_schedule = bias_map[op.epilogue_schedule]
+    for name in drop:
+        del func_attrs["op_instance"][name]
 
 
 def gen_profiler(
@@ -83,6 +167,11 @@ def gen_profiler(
         elem_input_type=elem_input_type,
         elem_output_type=elem_output_type,
     )
+    tmpl_3x = (
+        SM100_PROBLEM_ARGS_TEMPLATE_CUTLASS_3X
+        if Target.current()._arch == "100"
+        else problem_args_template_cutlass_3x
+    )
     return gemm_rcr.common_gen_profiler(
         func_attrs=func_attrs,
         workdir=workdir,
@@ -90,7 +179,7 @@ def gen_profiler(
         dim_info_dict=dim_info_dict,
         src_template=common_bias.SRC_TEMPLATE,
         problem_args_template=problem_args_template,
-        problem_args_template_cutlass_3x=problem_args_template_cutlass_3x,
+        problem_args_template_cutlass_3x=tmpl_3x,
         bias_ptr_arg="memory_pool->RequestTensorByIdx(3)",
         extra_code="\n\n".join([extra_code_header, extra_code]),
     )
@@ -120,7 +209,12 @@ def gen_function(
     )
     problem_args_cutlass_3x = ""
     if problem_args_template_cutlass_3x is not None:
-        problem_args_cutlass_3x = problem_args_template_cutlass_3x.render(
+        tmpl_3x = (
+            SM100_PROBLEM_ARGS_TEMPLATE_CUTLASS_3X
+            if Target.current()._arch == "100"
+            else problem_args_template_cutlass_3x
+        )
+        problem_args_cutlass_3x = tmpl_3x.render(
             elem_input_type=elem_input_type,
             elem_output_type=elem_output_type,
         )

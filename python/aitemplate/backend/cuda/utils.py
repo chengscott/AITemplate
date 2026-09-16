@@ -17,6 +17,7 @@ Util functions for CUDA codegen.
 """
 
 import logging
+import os
 
 from collections import OrderedDict
 
@@ -74,7 +75,7 @@ def gen_ops(
             # SM80 fallback ops accompany the forced SM90 pool for GEMMs only.
             # This fork's CUTLASS API 3.x (Hopper) host codegen supports TMA warp-
             # specialized (align-8) epilogues: gemms whose output N is not a
-            # multiple of 8 (policy/value heads N=1/2, ...) can't realize an
+            # multiple of 8 (e.g. small N such as 1 or 2) can't realize an
             # SM90 3.x TMA kernel and fall back to SM80 gemm kernels (which run
             # correctly on Hopper). The align-8 gemms still get and (via
             # profiling) prefer their SM90 3.x TMA kernels.
@@ -107,6 +108,34 @@ def gen_ops(
         else:
             cutlass_lib.generator.GenerateSM80(manifest, args.cuda_version)
             cutlass_lib.extra_operation.GenerateSM80(manifest, args)
+    elif arch == "100":
+        # Blackwell (sm_100): emit the SM80 (CUTLASS 2.x) kernel set, which AIT fully
+        # supports emitting and which compiles/runs correctly for sm_100a. This is the
+        # working GB200 build (Ampere-class gemms/convs on Blackwell; attention is
+        # native FA4 SM100).
+        #
+        # Native SM100 UMMA/tcgen05 gemms (GenerateSM100) PLUS the SM80 (2.x) fallback
+        # set (compiles for sm_100a). Bias fusion on SM100 uses the EVT epilogue
+        # (LinCombPerColBias) wired in gemm_rcr_bias.py -- SM100 has no BiasElementwise
+        # schedule (that trick is SM90-only). Fused-activation-bias variants
+        # (common_bias_activation) not yet on EVT drop their SM100 TMA ops and fall
+        # back to SM80. The profiler prefers an SM100 kernel where valid.
+        import os as _os
+
+        # Build toggle: AIT_SM100_GEMM=0 forces the SM80 (2.x) gemm/conv path everywhere
+        # (the "original" kernels compiled for sm_100a) -- useful for A/B and for
+        # workloads where the SM100 tcgen05 gemms' fixed cost hurts (small batch). Default
+        # on: emit native SM100 gemms too and let the profiler pick per shape.
+        _use_sm100_gemm = _os.environ.get("AIT_SM100_GEMM", "1") == "1"
+        if _use_sm100_gemm:
+            cutlass_lib.generator.GenerateSM100(manifest, args.cuda_version)
+        cutlass_lib.generator.GenerateSM80(manifest, args.cuda_version)
+        cutlass_lib.extra_operation.GenerateSM80(manifest, args)
+        if _use_sm100_gemm:
+            # Keep the SM80 conv pool + the safe (compiling) SM100 conv subset so the
+            # profiler can pick native SM100 convs where they win; the broad SM100 conv
+            # sweep otherwise breaks the build (see _filter_sm100_conv_ops).
+            _filter_sm100_conv_ops(cutlass_lib, manifest)
     else:
         try:
             func = getattr(cutlass_lib.generator, "GenerateSM" + arch)
@@ -130,7 +159,7 @@ def _generate_sm90_conv3x_f16_f32acc(cutlass_lib, manifest):
     GenerateSM90_Conv3x only emits f16-output conv kernels that accumulate in
     f16 (its MathInstruction accumulator == data_types['c_type'] == f16). AIT's
     f16 conv reference (and the FORCE=0 SM80 path) accumulates in f32, so f16
-    accumulation would break numerical parity on deep-channel trunk convs.
+    accumulation would break numerical parity on deep-channel convs.
 
     CreateConvOperator3x takes the accumulator from the tile description's math
     instruction, independently of the C/D element types, so here we build
@@ -241,6 +270,76 @@ def _drop_sm90_3x_gemm_ops(cutlass_lib, manifest):
                 level1[config_name] = kept
             else:
                 del level1[config_name]
+
+
+def _filter_sm100_conv_ops(cutlass_lib, manifest):
+    """Keep the SM80 (2.x) conv pool + only the SM100 (is_3x) conv configs that compile.
+
+    GenerateSM100_TensorOp_16b_UMMA_conv3x emits a broad sweep (1SM & 2SM schedules,
+    clusters up to [4,4,1], big tiles, stages=0 auto-deduce). Many of those trip the
+    SM100 UMMA compile-time asserts on small convolutions, e.g. 3x3 (Invalid TileShape,
+    2x1SM M/N-mode, "Stages >= 1" from auto-deduce overflowing SMEM on big tiles). We
+    keep only the safe subset -- 1SM schedules whose CTA tile (inst * cluster) stays within
+    the proven-safe 128x128 SMEM envelope (see _safe_sm100_conv; AIT_SM100_CONV_NARROW=1 forces
+    the older single-CTA-only set) -- alongside the 2.x conv pool, so the profiler picks
+    native-SM100-vs-SM80 per conv shape. GEMM ops are left intact.
+    """
+    library = cutlass_lib.library
+    conv_kinds = set()
+    for name in ("Conv2d", "Conv3d"):
+        kind = getattr(library.OperationKind, name, None)
+        if kind is not None:
+            conv_kinds.add(kind)
+
+    def _safe_sm100_conv(op):
+        td = op.tile_description
+        cluster = list(getattr(td, "cluster_shape", [1, 1, 1]) or [1, 1, 1])
+        inst = td.math_instruction.instruction_shape
+        # Default: the principled wider envelope -- 1SM schedules whose CTA tile (inst *
+        # cluster) stays within the proven-safe 128x128 SMEM footprint. This admits the
+        # M-multicast cluster variants ([2,1,1], [2,2,1] on inst 64xN) that give the profiler
+        # more kernels per shape, while still excluding what actually trips the SM100 UMMA
+        # asserts: InstN=256, [1,2,1]x128 (-> tile N=256), and every 2SM schedule (2-CTA M/N
+        # mode). cutlass's own procedural_name for arch>=90 already encodes tile+cluster, so
+        # there is no config-name collision (an earlier FileNotFoundError was a transient
+        # shared-FS makedirs race, now fixed in add_profiler, not a naming clash).
+        # AIT_SM100_CONV_NARROW=1 forces the old single-CTA-only [1,1,1] set as a fallback.
+        if "2sm" in str(getattr(op, "kernel_schedule", "")).lower():
+            return False
+        if any(c <= 0 for c in cluster) or cluster[2] != 1:
+            return False  # dynamic cluster (0 dims) needs a runtime cluster -> asserts here
+        if os.environ.get("AIT_SM100_CONV_NARROW", "0") == "1":
+            return cluster == [1, 1, 1] and inst[0] <= 128 and inst[1] <= 128
+        return inst[0] * cluster[0] <= 128 and inst[1] * cluster[1] <= 128
+
+    def _keep(ops):
+        return [
+            op
+            for op in ops
+            if (not getattr(op, "is_3x", False)) or _safe_sm100_conv(op)
+        ]
+
+    for kind in conv_kinds:
+        level1 = manifest.operations.get(kind)
+        if not level1:
+            continue
+        values = list(level1.values())
+        is_nested = bool(values) and all(isinstance(v, dict) for v in values)
+        if is_nested:
+            for _min_cc, configs in list(level1.items()):
+                for config_name, ops in list(configs.items()):
+                    kept = _keep(ops)
+                    if kept:
+                        configs[config_name] = kept
+                    else:
+                        del configs[config_name]
+        else:
+            for config_name, ops in list(level1.items()):
+                kept = _keep(ops)
+                if kept:
+                    level1[config_name] = kept
+                else:
+                    del level1[config_name]
 
 
 def _drop_sm80_conv_ops(cutlass_lib, manifest):

@@ -794,6 +794,13 @@ def emit_instance(
     cutlass_3x = op.gemm_kind == cutlass_lib.library.GemmKind.Universal3x
     if cutlass_3x:
         emitter = cutlass_lib.gemm_operation.EmitGemmUniversal3xInstance()
+        # Stock EmitGemmUniversal3xInstance.emit() reads self.epilogue_functor in its
+        # custom-functor (non-enum) branch but never sets it -- an AttributeError for our
+        # SM100/SM90 EVT functor objects (LinCombPerColBias / LinCombPerColBiasEltAct /
+        # LinCombPerColBiasMul). Mirror the operation's functor onto the emitter so stock
+        # cutlass resolves it, keeping 3rdparty/cutlass unpatched. (The enum-functor branch
+        # ignores this attribute, so it's harmless for ordinary ops.)
+        emitter.epilogue_functor = op.epilogue_functor
     else:
         emitter = cutlass_lib.gemm_operation.EmitGemmInstance()
         if emit_kernel:
@@ -881,6 +888,7 @@ def gen_function(
     inst_def_flag = set()
     instances = {}
     instance_decl = ""
+    algo_to_config_name = {}  # reuse config_name when the same algo backs >1 exec_cond
     exec_cond_to_cutlass_3x = {}
     for exec_item in exec_path.values():
         fname = "f" + sha1(exec_item.exec_cond.encode()).hexdigest()
@@ -895,6 +903,10 @@ def gen_function(
                 func_attrs=func_attrs,
             )
             inst_def_flag.add(algo)
+            # cache the config name so a later exec_cond reusing this algo (e.g. a second
+            # batch bucket that profiled to the same kernel) -- which gets config="" to
+            # avoid re-emitting -- can reuse it instead of parsing an empty config.
+            algo_to_config_name[algo] = extract_config_name(config, cutlass_3x=cutlass_3x)
         else:
             config = ""
         instance_template = (
@@ -903,10 +915,7 @@ def gen_function(
         inst = instance_template.render(
             config=config,
             name=fname,
-            config_name=extract_config_name(
-                config,
-                cutlass_3x=cutlass_3x,
-            ),
+            config_name=algo_to_config_name[algo],
         )
         instances[exec_item.exec_cond] = inst
         exec_cond_to_cutlass_3x[exec_item.exec_cond] = cutlass_3x
@@ -972,10 +981,20 @@ def build_profiler(file_pairs):
     return file_pairs
 
 
+def _write_profiler_source(src_path, src_code):
+    # The profiler dirs live on the cluster's shared filesystem, where a bare
+    # os.makedirs(prefix) before a batch of writes is racy: a stale/partial
+    # directory entry (TOCTOU, contention) can make a later open() fail with
+    # ENOENT even though the top-level makedirs "succeeded". Ensure the parent of
+    # each file exists immediately before writing it, idempotently.
+    os.makedirs(os.path.dirname(src_path), exist_ok=True)
+    with open(src_path, "w") as f:
+        f.write(src_code)
+
+
 def add_profiler(file_pairs, workdir, op_type, output_name, code):
     prefix = os.path.join(workdir, "profiler", op_type)
-    if not os.path.exists(prefix):
-        os.makedirs(prefix)
+    os.makedirs(prefix, exist_ok=True)
 
     obj_path = os.path.join(prefix, output_name)
     if os.path.exists(obj_path):
@@ -987,16 +1006,14 @@ def add_profiler(file_pairs, workdir, op_type, output_name, code):
         for src_name, src_code in code.items():
             # create each source file separately
             src_path = os.path.join(prefix, src_name + ".cu")
-            with open(src_path, "w") as f:
-                f.write(src_code)
+            _write_profiler_source(src_path, src_code)
             src_paths.append(src_path)
         # add multiple src paths to file_pairs
         file_pairs.append((src_paths, obj_path))
     else:
         # single-source profiler
         src_path = os.path.join(prefix, output_name + ".cu")
-        with open(src_path, "w") as f:
-            f.write(code)
+        _write_profiler_source(src_path, code)
         # add single src path to file_pairs
         file_pairs.append((src_path, obj_path))
 
@@ -1130,6 +1147,12 @@ def gen_profiler(
                 elem_input_type=elem_input_type,
                 elem_output_type=elem_output_type,
                 has_tma_epilogue=op_has_tma_epilogue,
+                # unified SM90a+SM100 EVT bias path (LinCombPerColBias); AIT_SM90_BIAS_SCHEDULE=1
+                # keeps the legacy SM90 bias-via-schedule (transposed) path on Hopper only.
+                evt=(
+                    Target.current()._arch == "100"
+                    or os.environ.get("AIT_SM90_BIAS_SCHEDULE", "0") != "1"
+                ),
             )
             if problem_args_template_cutlass_3x is not None
             else ""
@@ -1404,8 +1427,8 @@ def default_fproc(
 
         # This AITemplate fork's CUTLASS API 3.x gemm host codegen only supports TMA
         # warp-specialized epilogues. The low-alignment NoSmemWarpSpecialized 3.x ops
-        # (the only 3.x option when the output N is not a multiple of 8, e.g. the
-        # policy/value heads) have a plain thread::LinearCombination epilogue whose
+        # (the only 3.x option when the output N is not a multiple of 8) have a plain
+        # thread::LinearCombination epilogue whose
         # Arguments do NOT match the fusion-callback Arguments emitted by the 3.x
         # problem_args template -> they fail to compile ("too many initializer values"
         # / "no instance of constructor ...Arguments"). Drop every non-TMA 3.x op here
@@ -1420,8 +1443,8 @@ def default_fproc(
 
         # Universal3x kernels tag the epilogue via EpilogueFunctor3xTag, which is keyed
         # by EpilogueFunctor3x -- the 2x EpilogueFunctor.LinearCombination set above is
-        # not a key there, so the 3x emitter KeyErrors on a plain-LinearCombination gemm
-        # (e.g. the policy head). Convert it here, mirroring GemmOperation.__init__. The
+        # not a key there, so the 3x emitter KeyErrors on a plain-LinearCombination gemm.
+        # Convert it here, mirroring GemmOperation.__init__. The
         # non-LinearCombination 3x epilogues are already handled by the block above.
         # LinearCombinationResidualBlock (gemm_rcr_bias_add / _relu, via
         # common_bias_broadcast) is likewise not a 3x functor key -> it would KeyError in

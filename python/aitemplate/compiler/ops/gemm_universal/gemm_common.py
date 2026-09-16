@@ -369,6 +369,52 @@ class gemm(Operator):
             shape_values_dict[name] = sorted({min_value, max_value})
 
         self._attrs["exec_path"] = OrderedDict()
+        # Per-batch-bucket profiling (opt-in via AIT_GEMM_M_BUCKETS=N, N>=2). The default
+        # MAX/MIN strategies pick ONE kernel for the whole dynamic M range (a single
+        # exec_cond spanning [min,max]); the kernel best at max M is then used at small M
+        # too, which can leave small-M latency on the table (a max-tuned kernel is often
+        # materially slower at small M, tapering to no difference at large M, in exchange
+        # for higher profiling/build time and a larger .so). When exactly one dynamic dim
+        # (the gemm M) is present, split its [min,max] into N log-spaced buckets and emit one
+        # ExecItem per bucket -- each profiled at its own upper bound and dispatched by an
+        # M-range exec_cond -- so small and large M each get their own tuned kernel.
+        # Off by default (N<2) -> unchanged single-kernel behavior; callers opt in.
+        n_buckets = int(os.environ.get("AIT_GEMM_M_BUCKETS", "0") or "0")
+        dynamic_dims = {
+            name: vals for name, vals in shape_values_dict.items() if len(vals) > 1
+        }
+        if n_buckets >= 2 and len(dynamic_dims) == 1:
+            ((dname, dvals),) = dynamic_dims.items()
+            dlo, dhi = min(dvals), max(dvals)
+            lo_log = math.log(max(dlo, 1))
+            edges = sorted(
+                {dlo, dhi}
+                | {
+                    int(round(math.exp(lo_log + (math.log(dhi) - lo_log) * k / n_buckets)))
+                    for k in range(1, n_buckets)
+                }
+            )
+            prev = dlo
+            for edge in edges:
+                if edge < prev:
+                    continue
+                lo, hi = prev, edge
+                prof = {
+                    name: [hi if name == dname else vals[0]]
+                    for name, vals in shape_values_dict.items()
+                }
+                cond = {
+                    name: ([lo, hi] if name == dname else vals)
+                    for name, vals in shape_values_dict.items()
+                }
+                item = ExecItem(
+                    profiling_key=self._gen_exec_key(prof),
+                    exec_cond=self._gen_exec_key(cond),
+                    algo="",
+                )
+                self._attrs["exec_path"][item.profiling_key] = item
+                prev = hi + 1
+            return
         if dynamic_profiling_strategy == DynamicProfileStrategy.MAX:
             max_values = {
                 name: [max(shape_values)]
@@ -883,6 +929,7 @@ class GemmProfilerPostprocessingDelegate:
         The best instance is cached, and written into corresponding gemm nodes in the graph
         """
         target = backend.target.Target.current()
+        seen_func_attrs = {}
         for _, group in itertools.groupby(
             self._instances,
             key=_profiler_results_groupby_key,
@@ -899,6 +946,7 @@ class GemmProfilerPostprocessingDelegate:
             func_attrs["exec_path"][exec_key].algo = best_algo
             func_attrs["workspace"] = max(func_attrs["workspace"], workspace)
             func_attrs["split_k"] = split_k
+            seen_func_attrs[id(func_attrs)] = func_attrs
 
             _LOGGER.info(
                 f"Profiler ({profiler_filename} {exec_key}) selected kernel: "
@@ -933,3 +981,19 @@ class GemmProfilerPostprocessingDelegate:
                 target.insert_profile_cache("gemm", cache_record.__dict__)
             except Exception as e:
                 _LOGGER.warning(e)
+
+        # Per-batch-bucket safety net (AIT_GEMM_M_BUCKETS): a bucket whose profiler found
+        # no successful instance at its M leaves exec_path[key].algo == "" -> empty config
+        # -> codegen IndexError. Any profiled kernel for this op is correct at any M in the
+        # dynamic range (larger tiles just mask small M), so fill empty buckets from a
+        # non-empty sibling. No-op in the single-bucket MAX/MIN default.
+        for func_attrs in seen_func_attrs.values():
+            exec_path = func_attrs.get("exec_path", {})
+            valid = next(
+                (it.algo for it in exec_path.values() if getattr(it, "algo", "")), None
+            )
+            if valid is None:
+                continue
+            for item in exec_path.values():
+                if not getattr(item, "algo", ""):
+                    item.algo = valid

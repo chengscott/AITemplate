@@ -53,8 +53,18 @@ _CONFIGS = [
 ]
 
 
-def gemm_rcr_config(func_attrs, dtype="float16"):
-    return common_bias_broadcast.gemm_bias_broadcast_config(func_attrs, RCR)
+def gen_config_template(unary_op1, binary_op1, binary_op2, unary_op2):
+    def gemm_rcr_config(func_attrs, dtype="float16"):
+        return common_bias_broadcast.gemm_bias_broadcast_config(
+            func_attrs,
+            RCR,
+            unary_op1=unary_op1,
+            binary_op1=binary_op1,
+            binary_op2=binary_op2,
+            unary_op2=unary_op2,
+        )
+
+    return gemm_rcr_config
 
 
 def gen_profiler_template(unary_op1, binary_op1, binary_op2, unary_op2):
@@ -124,7 +134,9 @@ def function_filter(cfg, func_attrs, ab_alignment):
 
 for conf in _CONFIGS:
     name, unary_op1, binary_op1, binary_op2, unary_op2 = conf
-    registry.reg(f"cuda.gemm_rcr_bias_{name}.config")(gemm_rcr_config)
+    registry.reg(f"cuda.gemm_rcr_bias_{name}.config")(
+        gen_config_template(unary_op1, binary_op1, binary_op2, unary_op2)
+    )
     registry.reg(f"cuda.gemm_rcr_bias_{name}.gen_profiler")(
         gen_profiler_template(unary_op1, binary_op1, binary_op2, unary_op2)
     )

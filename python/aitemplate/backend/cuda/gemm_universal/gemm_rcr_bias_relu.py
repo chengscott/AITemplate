@@ -55,6 +55,36 @@ PROBLEM_ARGS_TEMPLATE = jinja2.Template(
 PROBLEM_ARGS_TEMPLATE_CUTLASS_3X = jinja2.Template(
     """
     cutlass::gemm::GemmUniversalMode::kGemm,                     // GemmUniversalMode mode
+{% if sm100 %}
+    {
+        static_cast<coord_t>(M),
+        static_cast<coord_t>(N),
+        static_cast<coord_t>(K),
+        static_cast<coord_t>(1)
+    },                                                           // ProblemShape problem_shape
+    {  // MainloopArguments mainloop (non-transposed; bias+relu fused via EVT)
+    ({{elem_input_type}}*)(a_ptr),                               // ElementA const* ptr_A
+    {K, cute::Int<1>{}, cute::Int<0>{}},                         // StrideA dA
+    ({{elem_input_type}}*)(b_ptr),                               // ElementB const* ptr_B
+    {K, cute::Int<1>{}, cute::Int<0>{}},                         // StrideB dB
+    },
+    {  // EpilogueArguments (LinCombPerColBiasEltAct<ReLu>: relu(alpha*acc + beta*C + bias))
+        {                                                        // thread (fusion args)
+            ElementComputeEpilogue(1),                           // alpha
+            ElementComputeEpilogue(0),                           // beta (no residual C)
+            nullptr,                                             // alpha_ptr
+            nullptr,                                             // beta_ptr
+            {cute::Int<0>{}, cute::Int<0>{}, int64_t(0)},        // StrideAlpha dAlpha
+            {cute::Int<0>{}, cute::Int<0>{}, int64_t(0)},        // StrideBeta dBeta
+            ({{elem_input_type}}*)(bias_ptr),                    // ElementBias const* bias_ptr
+            {cute::Int<0>{}, cute::Int<1>{}, int64_t(0)},        // StrideBias dBias (per-col)
+        },
+        nullptr,                                                 // ElementC const* ptr_C
+        {cute::Int<0>{}, cute::Int<1>{}, cute::Int<0>{}},        // StrideC dC
+        ({{elem_output_type}}*)(c_ptr) + output_offset,          // ElementD* ptr_D
+        {output_stride, cute::Int<1>{}, cute::Int<0>{}},         // StrideD dD
+    },                                                           // EpilogueArguments epilogue
+{% else %}
     {
         static_cast<coord_t>(N),
         static_cast<coord_t>(M),
@@ -75,6 +105,7 @@ PROBLEM_ARGS_TEMPLATE_CUTLASS_3X = jinja2.Template(
         {cute::Int<1>{}, output_stride, cute::Int<0>{}},         // StrideD dD
         ({{elem_input_type}}*)(bias_ptr),                        // ElementBias const* ptr_Bias
     },                                                           // EpilogueArguments epilogue
+{% endif %}
 """
 )
 
@@ -85,6 +116,7 @@ def gemm_rcr_config(func_attrs, dtype="float16"):
         func_attrs=func_attrs,
         dtype=dtype,
         include_cutlass_3x_ops=True,
+        activation_tag="cutlass::epilogue::thread::ReLu",
     )
 
 

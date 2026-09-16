@@ -45,6 +45,7 @@ def _detect_cuda_with_nvidia_smi():
             "75": ["T4", "Quadro T2000"],
             "80": ["PG509", "A100", "A800", "A10G", "RTX 30", "A30", "RTX 40"],
             "90": ["H100", "H800", "H200"],
+            "100": ["GB200", "B200", "GB100", "B100"],
         }
         for sm, names in sm_names.items():
             if any(name in stdout for name in names):
@@ -56,7 +57,11 @@ def _detect_cuda_with_nvidia_smi():
 
 def _detect_cuda():
     try:
-        from cuda import cuda
+        try:
+            from cuda import cuda
+        except ImportError:
+            # cuda-python 13.x moved the driver bindings to cuda.bindings
+            from cuda.bindings import driver as cuda
 
         def assert_cuda(res):
             if res[0].value != 0:
@@ -67,7 +72,11 @@ def _detect_cuda():
         # Get Compute Capability of the first Visible device
         major, minor = assert_cuda(cuda.cuDeviceComputeCapability(0))
         comp_cap = major * 10 + minor
-        if comp_cap >= 90:
+        if comp_cap >= 100:
+            # Blackwell datacenter (GB200/B200 = sm_100). Consumer Blackwell
+            # (sm_120) is not handled here.
+            return "100"
+        elif comp_cap >= 90:
             return "90"
         elif comp_cap >= 80:
             return "80"

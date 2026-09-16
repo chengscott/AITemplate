@@ -73,6 +73,7 @@ class FlashAttentionFwdSm90Aot:
         softmax_scale: float,
         is_causal: bool,
         dtype=cutlass.Float16,
+        seq_len: int = None,  # unused on SM90 (tile/stage config is seqlen-agnostic)
     ):
         self.softmax_scale = softmax_scale
         # Dense (no local/window) forward; head_dim_v == head_dim.
