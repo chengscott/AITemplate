@@ -44,6 +44,7 @@ from aitemplate.backend.cuda.gemm_universal import (
     group_gemm_rcr_bias_sigmoid,
     rmsnorm,
     rms_reduce,
+    rms_quantize,
     rope2d,
     swiglu,
     unpack_rope,
