@@ -20,6 +20,7 @@ FUNC_TEMPLATE = jinja2.Template(
 #include "cutlass/gemm/gemm.h"
 #include "cutlass/gemm/dispatch_policy.hpp"
 #include "cutlass/gemm/collective/collective_builder.hpp"
+#include "cutlass/epilogue/dispatch_policy.hpp"
 #include "cutlass/epilogue/collective/collective_builder.hpp"
 #include "cutlass/gemm/device/gemm_universal_adapter.h"
 #include "cutlass/gemm/kernel/gemm_universal.hpp"
@@ -35,8 +36,9 @@ using ElementCompute = float;
 using LayoutA = cutlass::layout::RowMajor;
 using LayoutB = cutlass::layout::ColumnMajor;
 using LayoutC = cutlass::layout::RowMajor;
-// Tile chosen by N (swept on H200): N%256==0 -> 128x256 (fc1/up), N==384 -> 256x128 (qkv),
-// N<=128 -> 128x128 (o/fc2/down). Cluster 1x1x1 (2x1 was not faster).
+// SM90: tile chosen by N (swept on H200): N%256==0 -> 128x256 (fc1/up), N==384 -> 256x128
+// (qkv), N<=128 -> 128x128 (o/fc2/down). SM100 (Blackwell tcgen05, 1SM): MMA tile M must be
+// 128, N=128, K=64; cluster all-ones (1SM). Cluster 1x1x1 in both.
 using TileShapeMNK    = {{tile}};
 using ClusterShapeMNK = Shape<_1, _1, _1>;
 constexpr int AlignA = 128 / cutlass::sizeof_bits<ElementA>::value;   // 16
@@ -44,28 +46,30 @@ constexpr int AlignB = 128 / cutlass::sizeof_bits<ElementB>::value;   // 16
 constexpr int AlignC = 128 / cutlass::sizeof_bits<ElementOut>::value; // 8
 
 // Per-ROW (per-token) scale: D = alpha[m]*acc + beta*C (+ per-row bias, unused=0).
+// Works verbatim on SM100: its Sm100TmaWarpSpecialized FusionCallbacks inherit the Sm90
+// specialization for this op (cutlass sm100_callbacks_tma_warpspecialized.hpp).
 using FusionOp = cutlass::epilogue::fusion::PerRowLinCombPerRowBiasEltAct<
     cutlass::epilogue::thread::Identity, ElementOut, ElementCompute, ElementOut,
     ElementOut, float>;
 
 using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
-    cutlass::arch::Sm90, cutlass::arch::OpClassTensorOp, TileShapeMNK, ClusterShapeMNK,
+    cutlass::arch::{{arch_tag}}, cutlass::arch::OpClassTensorOp, TileShapeMNK, ClusterShapeMNK,
     cutlass::epilogue::collective::EpilogueTileAuto, ElementAcc, ElementCompute,
     ElementOut, LayoutC, AlignC,
     ElementOut, LayoutC, AlignC,
-    cutlass::epilogue::TmaWarpSpecializedCooperative, FusionOp>::CollectiveOp;
+    {{epi_sched}}, FusionOp>::CollectiveOp;
 
 using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
-    cutlass::arch::Sm90, cutlass::arch::OpClassTensorOp,
+    cutlass::arch::{{arch_tag}}, cutlass::arch::OpClassTensorOp,
     ElementA, LayoutA, AlignA,
     ElementB, LayoutB, AlignB,
     ElementAcc, TileShapeMNK, ClusterShapeMNK,
     cutlass::gemm::collective::StageCountAutoCarveout<
         static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))>,
-    cutlass::gemm::KernelTmaWarpSpecializedCooperativeFP8FastAccum>::CollectiveOp;
+    {{mainloop_sched}}>::CollectiveOp;
 
 using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
-    Shape<int, int, int, int>, CollectiveMainloop, CollectiveEpilogue>;
+    Shape<int, int, int, int>, CollectiveMainloop, CollectiveEpilogue{{sched_arg}}>;
 using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
 using StrideA = typename Gemm::GemmKernel::StrideA;
 using StrideB = typename Gemm::GemmKernel::StrideB;
@@ -169,7 +173,7 @@ FUNC_CALL_TEMPLATE = jinja2.Template(
 
 
 def _tile_for_n(N):
-    # swept on H200 for the go9 fp8 gemm shapes (RCR, cooperative FP8 FastAccum).
+    # SM90: swept on H200 for the trunk fp8 gemm shapes (RCR, cooperative FP8 FastAccum).
     if N >= 256 and N % 256 == 0:
         return "Shape<_128, _256, Shape<_128>>"
     if N > 128:
@@ -177,12 +181,41 @@ def _tile_for_n(N):
     return "Shape<_128, _128, Shape<_128>>"
 
 
+# Per-arch collective-builder config. SM90 (Hopper WGMMA) uses the cooperative FP8-FastAccum
+# schedule + a per-N tile; SM100 (Blackwell tcgen05) uses the 1SM warp-specialized schedule,
+# a fixed MMA tile (M=128, N=128, K=64), and the CLC tile scheduler (extra `void` kernel arg).
+# On Blackwell fp8 fast-accumulation is intrinsic to the UMMA -- no FastAccum schedule exists.
+def _arch_config(func_attrs):
+    from aitemplate.backend.target import Target
+
+    arch = Target.current()._arch
+    if arch == "100":
+        # Auto+Auto is the guaranteed-compatible SM100 pairing (cutlass example 70 ships it
+        # with a per-row fusion). ClusterShape<_1,_1,_1> forces the 1SM schedule under Auto,
+        # so MMA tile M=128 is valid. Switch to the explicit KernelTmaWarpSpecialized1SmSm100
+        # / TmaWarpSpecialized1Sm pair if per-shape control is needed later.
+        return {
+            "arch_tag": "Sm100",
+            "epi_sched": "cutlass::epilogue::collective::EpilogueScheduleAuto",
+            "mainloop_sched": "cutlass::gemm::collective::KernelScheduleAuto",
+            "tile": "Shape<_128, _128, _64>",
+            "sched_arg": ", void",
+        }
+    return {
+        "arch_tag": "Sm90",
+        "epi_sched": "cutlass::epilogue::TmaWarpSpecializedCooperative",
+        "mainloop_sched": "cutlass::gemm::KernelTmaWarpSpecializedCooperativeFP8FastAccum",
+        "tile": _tile_for_n(func_attrs["N"]),
+        "sched_arg": "",
+    }
+
+
 @registry.reg("cuda.gemm_rcr_fp8_fused.gen_function")
 def gen_function(func_attrs):
     return FUNC_TEMPLATE.render(
         func_name=func_attrs["name"], N=func_attrs["N"], K=func_attrs["K"],
         has_residual=func_attrs.get("has_residual", False),
-        tile=_tile_for_n(func_attrs["N"]),
+        **_arch_config(func_attrs),
     )
 
 
