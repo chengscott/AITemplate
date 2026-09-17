@@ -22,7 +22,9 @@ FUNC_TEMPLATE = jinja2.Template(
 #include "cutlass/conv/convnd_problem_shape.hpp"
 #include "cutlass/conv/dispatch_policy.hpp"
 #include "cutlass/conv/collective/collective_builder.hpp"
+#include "cutlass/epilogue/dispatch_policy.hpp"
 #include "cutlass/epilogue/collective/collective_builder.hpp"
+{% if arch_tag == "Sm100" %}#include "cutlass/epilogue/fusion/sm100_callbacks_tma_warpspecialized.hpp"{% endif %}
 #include "cutlass/conv/device/conv_universal_adapter.hpp"
 #include "cutlass/conv/kernel/conv_universal.hpp"
 
@@ -102,7 +104,8 @@ using ElementFlt     = cutlass::float_e4m3_t;
 using ElementOut     = cutlass::half_t;
 using ElementAcc     = float;
 using ElementCompute = float;
-using TileShapeMNK    = Shape<_128, _128, Shape<_128>>;
+// SM90 uses a K-mode tile of 128; SM100 (tcgen05 1SM) uses 64 (ex76). MMA tile M=128, N=128.
+using TileShapeMNK    = Shape<_128, _128, Shape<{{tile_k}}>>;
 using ClusterShapeMNK = Shape<_1, _1, _1>;
 constexpr int AlignA = 128 / cutlass::sizeof_bits<ElementAct>::value;
 constexpr int AlignB = 128 / cutlass::sizeof_bits<ElementFlt>::value;
@@ -118,15 +121,17 @@ using FusionOp =
         {{act_fn}}, ElementOut, ElementCompute, ElementOut, ElementOut, float>;
 {% endif %}
 
+// SM100: the custom LinCombPerColBiasEltActAmaxD FusionCallbacks specialization (keyed on
+// Sm90TmaWarpSpecialized) is reused via the generic Sm100->Sm90 callbacks aliasing.
 using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
-    cutlass::arch::Sm90, cutlass::arch::OpClassTensorOp, TileShapeMNK, ClusterShapeMNK,
+    cutlass::arch::{{arch_tag}}, cutlass::arch::OpClassTensorOp, TileShapeMNK, ClusterShapeMNK,
     cutlass::epilogue::collective::EpilogueTileAuto, ElementAcc, ElementCompute,
     ElementOut, cutlass::layout::TensorNHWC, AlignC,
     ElementOut, cutlass::layout::TensorNHWC, AlignC,
-    cutlass::epilogue::TmaWarpSpecialized, FusionOp>::CollectiveOp;
+    {{epi_sched}}, FusionOp>::CollectiveOp;
 
 using CollectiveMainloop = typename cutlass::conv::collective::CollectiveBuilder<
-    cutlass::arch::Sm90, cutlass::arch::OpClassTensorOp, cutlass::conv::Operator::kFprop,
+    cutlass::arch::{{arch_tag}}, cutlass::arch::OpClassTensorOp, cutlass::conv::Operator::kFprop,
     ElementAct, cutlass::layout::TensorNHWC, AlignA,
     ElementFlt, cutlass::layout::TensorNHWC, AlignB,
     ElementAcc, TileShapeMNK, ClusterShapeMNK,
@@ -235,11 +240,29 @@ FUNC_CALL_TEMPLATE = jinja2.Template(
 
 @registry.reg("cuda.conv2d_fp8.gen_function")
 def gen_function(func_attrs):
+    from aitemplate.backend.target import Target
+
     act_fn = (
         "cutlass::epilogue::thread::ReLU"
         if func_attrs["relu"]
         else "cutlass::epilogue::thread::Identity"
     )
+    # SM90 (Hopper) vs SM100 (Blackwell tcgen05) conv collective builder. The mainloop
+    # schedule (conv KernelScheduleAuto) is valid on both; only the arch tag, the epilogue
+    # schedule (Auto on SM100), and the tile-K (64 on SM100) differ. The amax FusionCallbacks
+    # is reused unchanged (Sm100 callbacks alias to Sm90).
+    if Target.current()._arch == "100":
+        arch_cfg = {
+            "arch_tag": "Sm100",
+            "epi_sched": "cutlass::epilogue::collective::EpilogueScheduleAuto",
+            "tile_k": "_64",
+        }
+    else:
+        arch_cfg = {
+            "arch_tag": "Sm90",
+            "epi_sched": "cutlass::epilogue::TmaWarpSpecialized",
+            "tile_k": "_128",
+        }
     return FUNC_TEMPLATE.render(
         func_name=func_attrs["name"], act_fn=act_fn,
         has_residual=func_attrs.get("has_residual", False),
@@ -248,6 +271,7 @@ def gen_function(func_attrs):
         K=func_attrs["K"], R=func_attrs["R"], S=func_attrs["S"],
         OH=func_attrs["OH"], OW=func_attrs["OW"],
         pad=func_attrs["pad"], stride=func_attrs["stride"],
+        **arch_cfg,
     )
 
 
