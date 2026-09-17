@@ -226,15 +226,17 @@ void {{func_name}}(const void* a_ptr, {% if norm == 'rmsnorm' %}const void* gamm
   auto layout_SFA = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFA(cute::make_shape(static_cast<int>(M), N, K, 1));
   auto layout_SFB = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(cute::make_shape(static_cast<int>(M), N, K, 1));
   cutlass::KernelHardwareInfo hw_info;
-  // Static workspaces (quantized activation e4m3 + swizzled SFA ue8m0 + cutlass workspace),
-  // allocated ONCE at the built max M ({{max_m}}) and NEVER freed/realloc'd. Sizing at max M
-  // (not per-call M) keeps the pointers stable so they can be safely baked into a captured CUDA
-  // graph: a later, larger batch would otherwise cudaFree a pointer a graph already captured
-  // (use-after-free on replay). Max-M buffers cover every M in the built [1,{{max_m}}] range;
-  // a per-call-M layout indexes a prefix of them.
-  static DataA* s_aq = nullptr;
-  static unsigned char* s_sfa = nullptr;
-  static uint8_t* s_ws = nullptr;
+  // Workspaces (quantized activation e4m3 + swizzled SFA ue8m0 + cutlass workspace), allocated
+  // ONCE at the built max M ({{max_m}}) and NEVER freed/realloc'd. Sizing at max M (not per-call
+  // M) keeps the pointers stable so they can be safely baked into a captured CUDA graph: a later,
+  // larger batch would otherwise cudaFree a pointer a graph already captured (use-after-free on
+  // replay). Max-M buffers cover every M in the built [1,{{max_m}}] range; a per-call-M layout
+  // indexes a prefix. thread_local (one set per host thread) so concurrent inference threads (each
+  // on its own stream via use_unique_stream_per_thread) don't clobber a shared quantize buffer;
+  // costs the workspace x #threads.
+  thread_local static DataA* s_aq = nullptr;
+  thread_local static unsigned char* s_sfa = nullptr;
+  thread_local static uint8_t* s_ws = nullptr;
   if (s_aq == nullptr) {
     const int MM = {{max_m}};
     cudaMalloc(&s_aq, sizeof(DataA) * (size_t)MM * K);

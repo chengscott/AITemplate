@@ -101,8 +101,10 @@ void {{func_name}}(const void* a_ptr, const void* b_ptr, const void* scale_x_ptr
                    void* out_ptr, int64_t M, cudaStream_t stream) {
   using namespace {{func_name}}_ns;
   const int N = {{N}}, K = {{K}};
-  static float* s_alpha = nullptr;
-  static size_t s_alpha_m = 0;
+  // thread_local: one workspace set per host thread so concurrent inference threads (each on its
+  // own stream) don't clobber a shared buffer (review finding #2). Costs the workspace x #threads.
+  thread_local static float* s_alpha = nullptr;
+  thread_local static size_t s_alpha_m = 0;
   if ((size_t)M > s_alpha_m) {
     if (s_alpha) cudaFree(s_alpha);
     cudaMalloc(&s_alpha, sizeof(float) * (size_t)M);
@@ -142,8 +144,8 @@ void {{func_name}}(const void* a_ptr, const void* b_ptr, const void* scale_x_ptr
   fa.bias_ptr = nullptr;    // linears are bias-free (=> bias contribution 0)
 
   Gemm gemm_op;
-  static uint8_t* s_ws = nullptr;
-  static size_t s_ws_sz = 0;
+  thread_local static uint8_t* s_ws = nullptr;
+  thread_local static size_t s_ws_sz = 0;
   size_t need = Gemm::get_workspace_size(arguments);
   if (need > s_ws_sz) {
     if (s_ws) cudaFree(s_ws);
