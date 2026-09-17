@@ -53,6 +53,7 @@ from aitemplate.backend.cuda.gemm_universal import (
     im2col_fp8,
     conv2d_fp8,
     gemm_rcr_fp8_fused,
+    gemm_rcr_mxfp8,
     quantize_to_fp8_tensor,
     quantize_to_fp8_amax,
     perm021fc_ccr,

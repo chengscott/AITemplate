@@ -105,6 +105,7 @@ from aitemplate.compiler.ops.gemm_universal.dequant_fp8 import dequant_fp8
 from aitemplate.compiler.ops.gemm_universal.im2col_fp8 import im2col_fp8
 from aitemplate.compiler.ops.gemm_universal.conv2d_fp8 import conv2d_fp8
 from aitemplate.compiler.ops.gemm_universal.gemm_rcr_fp8_fused import gemm_rcr_fp8_fused
+from aitemplate.compiler.ops.gemm_universal.gemm_rcr_mxfp8 import gemm_rcr_mxfp8
 from aitemplate.compiler.ops.gemm_universal.quantize_to_fp8_tensor import (
     quantize_to_fp8_tensor,
 )
