@@ -111,18 +111,22 @@ __global__ void {{func_name}}_quant(const __half* __restrict__ a, unsigned char*
 #endif
 }  // namespace {{func_name}}_ns
 
-// A [M,{{K}}] f16, B [{{N}},{{K}}] e4m3 + b_scale (ue8m0 swizzled SFB, baked) -> D [M,{{N}}] f16.
-void {{func_name}}(const void* a_ptr, const void* b_ptr, const void* bscale_ptr,
+// A [M,{{K}}]{{ ' e4m3 + a_scale (swizzled SFA)' if prequant else ' f16 (quantized internally)' }},
+// B [{{N}},{{K}}] e4m3 + b_scale (ue8m0 swizzled SFB, baked) -> D [M,{{N}}] f16.
+void {{func_name}}(const void* a_ptr, {% if prequant %}const void* ascale_ptr, {% endif %}const void* b_ptr, const void* bscale_ptr,
                    const void* residual_ptr, void* out_ptr, int64_t M, cudaStream_t stream) {
   using namespace {{func_name}}_ns;
-  const int N = {{N}}, K = {{K}}, nkb = K / 32, ntx = (nkb + 3) / 4;
+  const int N = {{N}}, K = {{K}}, nkb = K / 32, ntx = (nkb + 3) / 4; (void)nkb; (void)ntx;
   StrideA stride_A = cutlass::make_cute_packed_stride(StrideA{}, {static_cast<int>(M), K, 1});
   StrideB stride_B = cutlass::make_cute_packed_stride(StrideB{}, {N, K, 1});
   StrideC stride_C = cutlass::make_cute_packed_stride(StrideC{}, {static_cast<int>(M), N, 1});
   StrideD stride_D = cutlass::make_cute_packed_stride(StrideD{}, {static_cast<int>(M), N, 1});
   auto layout_SFA = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFA(cute::make_shape(static_cast<int>(M), N, K, 1));
   auto layout_SFB = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(cute::make_shape(static_cast<int>(M), N, K, 1));
-
+{% if prequant %}
+  const DataA* a_e4m3 = reinterpret_cast<const DataA*>(a_ptr);
+  const ScaleT* a_sf = reinterpret_cast<const ScaleT*>(ascale_ptr);
+{% else %}
   // static workspaces: quantized activation (e4m3) + its swizzled SFA (ue8m0)
   static DataA* s_aq = nullptr; static size_t s_aq_m = 0;
   static unsigned char* s_sfa = nullptr; static size_t s_sfa_sz = 0;
@@ -135,12 +139,14 @@ void {{func_name}}(const void* a_ptr, const void* b_ptr, const void* bscale_ptr,
                                                reinterpret_cast<unsigned char*>(s_aq), s_sfa,
                                                (long long)M, nkb, ntx);
   }
-
+  const DataA* a_e4m3 = s_aq;
+  const ScaleT* a_sf = reinterpret_cast<const ScaleT*>(s_sfa);
+{% endif %}
   cutlass::KernelHardwareInfo hw_info;
   typename Gemm::Arguments arguments{
       cutlass::gemm::GemmUniversalMode::kGemm, {static_cast<int>(M), N, K, 1},
-      {s_aq, stride_A, reinterpret_cast<const DataA*>(b_ptr), stride_B,
-       reinterpret_cast<const ScaleT*>(s_sfa), layout_SFA, reinterpret_cast<const ScaleT*>(bscale_ptr), layout_SFB},
+      {a_e4m3, stride_A, reinterpret_cast<const DataA*>(b_ptr), stride_B,
+       a_sf, layout_SFA, reinterpret_cast<const ScaleT*>(bscale_ptr), layout_SFB},
       {{'{'}}{1.0f, {{ '1.0f' if has_residual else '0.0f' }}},
        reinterpret_cast<const ElementOut*>({{ 'residual_ptr' if has_residual else 'out_ptr' }}), stride_C,
        reinterpret_cast<ElementOut*>(out_ptr), stride_D{{'}'}},
@@ -157,13 +163,14 @@ void {{func_name}}(const void* a_ptr, const void* b_ptr, const void* bscale_ptr,
 )
 
 FUNC_DECL_TEMPLATE = jinja2.Template(
-    "\nvoid {{func_name}}(const void*, const void*, const void*, const void*, void*, int64_t, cudaStream_t);\n"
+    "\nvoid {{func_name}}(const void*, {% if prequant %}const void*, {% endif %}const void*, const void*, "
+    "const void*, void*, int64_t, cudaStream_t);\n"
 )
 
 FUNC_CALL_TEMPLATE = jinja2.Template(
     """
 {{indent}}{{func_name}}(
-{{indent}}    {{a_ptr}}, {{b_ptr}}, {{bscale_ptr}}, {{residual_ptr}}, {{out_ptr}}, {{m_expr}}, stream
+{{indent}}    {{a_ptr}}, {% if ascale_ptr %}{{ascale_ptr}}, {% endif %}{{b_ptr}}, {{bscale_ptr}}, {{residual_ptr}}, {{out_ptr}}, {{m_expr}}, stream
 {{indent}});
 """
 )
@@ -182,24 +189,33 @@ def gen_function(func_attrs):
     tile, cluster = _tile_cluster()
     return FUNC_TEMPLATE.render(
         func_name=func_attrs["name"], N=func_attrs["N"], K=func_attrs["K"],
-        has_residual=func_attrs.get("has_residual", False), tile=tile, cluster=cluster,
+        has_residual=func_attrs.get("has_residual", False),
+        prequant=func_attrs.get("has_prequant", False), tile=tile, cluster=cluster,
     )
 
 
 @registry.reg("cuda.gemm_rcr_mxfp8.func_decl")
 def gen_function_decl(func_attrs):
-    return FUNC_DECL_TEMPLATE.render(func_name=func_attrs["name"])
+    return FUNC_DECL_TEMPLATE.render(
+        func_name=func_attrs["name"], prequant=func_attrs.get("has_prequant", False)
+    )
 
 
 @registry.reg("cuda.gemm_rcr_mxfp8.func_call")
 def gen_function_call(func_attrs, indent="  "):
     ins = func_attrs["inputs"]
     a, b, bscale = ins[0], ins[1], ins[2]
-    residual_ptr = ins[3]._attrs["name"] if func_attrs.get("has_residual", False) else "nullptr"
+    idx = 3
+    ascale_ptr = None
+    if func_attrs.get("has_prequant", False):
+        ascale_ptr = ins[idx]._attrs["name"]
+        idx += 1
+    residual_ptr = ins[idx]._attrs["name"] if func_attrs.get("has_residual", False) else "nullptr"
     out = func_attrs["outputs"][0]
     m_expr = " * ".join(d._attrs["name"] for d in a._attrs["shape"][:-1]) or "1"
     return FUNC_CALL_TEMPLATE.render(
         indent=indent, func_name=func_attrs["name"],
-        a_ptr=a._attrs["name"], b_ptr=b._attrs["name"], bscale_ptr=bscale._attrs["name"],
+        a_ptr=a._attrs["name"], ascale_ptr=ascale_ptr,
+        b_ptr=b._attrs["name"], bscale_ptr=bscale._attrs["name"],
         residual_ptr=residual_ptr, out_ptr=out._attrs["name"], m_expr=m_expr,
     )

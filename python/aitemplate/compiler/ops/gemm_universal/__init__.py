@@ -96,6 +96,7 @@ from aitemplate.compiler.ops.gemm_universal.gemm_rrr_permute import gemm_rrr_per
 from aitemplate.compiler.ops.gemm_universal.rmsnorm import rmsnorm
 from aitemplate.compiler.ops.gemm_universal.rms_reduce import rms_reduce
 from aitemplate.compiler.ops.gemm_universal.rms_quantize import rms_quantize
+from aitemplate.compiler.ops.gemm_universal.rms_quantize_mxfp8 import rms_quantize_mxfp8
 from aitemplate.compiler.ops.gemm_universal.rope2d import rope2d
 from aitemplate.compiler.ops.gemm_universal.swiglu import swiglu
 from aitemplate.compiler.ops.gemm_universal.unpack_rope import unpack_rope

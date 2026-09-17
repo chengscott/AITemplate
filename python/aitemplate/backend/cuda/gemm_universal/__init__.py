@@ -45,6 +45,7 @@ from aitemplate.backend.cuda.gemm_universal import (
     rmsnorm,
     rms_reduce,
     rms_quantize,
+    rms_quantize_mxfp8,
     rope2d,
     swiglu,
     unpack_rope,
