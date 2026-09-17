@@ -33,7 +33,7 @@ class gemm_rcr_mxfp8(Operator):
         Nn = b._attrs["shape"][0]._attrs["values"][0]
         assert K == Kb, f"gemm_rcr_mxfp8 K mismatch {K} vs {Kb}"
         assert K % 32 == 0, f"gemm_rcr_mxfp8 needs K % 32 == 0 (SFVecSize), got {K}"
-        assert norm in ("none", "rmsnorm", "swiglu"), f"gemm_rcr_mxfp8 unknown norm {norm}"
+        assert norm in ("none", "rmsnorm", "swiglu", "rms_out"), f"gemm_rcr_mxfp8 unknown norm {norm}"
         self._attrs["N"], self._attrs["K"] = Nn, K
         self._attrs["has_prequant"] = a_scale is not None
         self._attrs["has_residual"] = residual is not None
@@ -57,6 +57,14 @@ class gemm_rcr_mxfp8(Operator):
         out = Tensor(
             list(a._attrs["shape"][:-1]) + [IntImm(Nn)], src_ops={self}, dtype="float16"
         )
+        if norm == "rms_out":
+            # 2nd output: per-row rrms [M,1] (folds ops.rms_reduce). quantizes RAW x; rrms is
+            # applied downstream (unpack_rope / fc2-swiglu). No gamma/residual in this mode.
+            rrms_o = Tensor(
+                list(a._attrs["shape"][:-1]) + [IntImm(1)], src_ops={self}, dtype="float16"
+            )
+            self._attrs["outputs"] = [out, rrms_o]
+            return out, rrms_o
         self._attrs["outputs"] = [out]
         return out
 

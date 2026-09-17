@@ -74,6 +74,7 @@ using Sm1xxBlkScaledConfig = typename GemmKernel::CollectiveMainloop::Sm1xxBlkSc
 __global__ void {{func_name}}_quant(const __half* __restrict__ a,
 {% if norm == 'rmsnorm' %}                                    const __half* __restrict__ gamma, float eps,
 {% endif %}{% if norm == 'swiglu' %}                                    const __half* __restrict__ rrms,
+{% endif %}{% if norm == 'rms_out' %}                                    __half* __restrict__ rrms_out, float eps,
 {% endif %}                                    unsigned char* __restrict__ aq,
                                     unsigned char* __restrict__ sfa, long long rows, int nkb, int ntx) {
   const int warps_per_cta = blockDim.x >> 5;
@@ -118,6 +119,38 @@ __global__ void {{func_name}}_quant(const __half* __restrict__ a,
       uint2 out; unsigned short* os = reinterpret_cast<unsigned short*>(&out);
 #pragma unroll
       for (int i = 0; i < 4; i++) { float2 f = __half22float2(zh[i]); f.x *= inv; f.y *= inv; os[i] = __nv_fp8x2_e4m3(f).__x; }
+      aqr[kb * 4 + j] = out; }
+  }
+{% elif norm == 'rms_out' %}
+  // qkv/fc1 rmsnorm-prologue: quantize RAW x (gamma is folded into the weight) AND emit per-row
+  // rrms = rsqrt(mean(x^2)+eps) as a 2nd output (folds ops.rms_reduce -> no separate read of x).
+  // unpack_rope / fc2-swiglu apply rrms downstream. One read of x (held in xbuf for the quantize).
+  uint4 xbuf[{{NCHUNK}}][4]; float ss = 0.f; int bi = 0;
+  for (int kb = lane; kb < nkb; kb += 32, bi++) {
+#pragma unroll
+    for (int j = 0; j < 4; j++) { uint4 q = ar[kb * 4 + j]; xbuf[bi][j] = q; const __half2* h = reinterpret_cast<const __half2*>(&q);
+#pragma unroll
+      for (int i = 0; i < 4; i++) { float2 f = __half22float2(h[i]); ss += f.x * f.x + f.y * f.y; } }
+  }
+#pragma unroll
+  for (int o = 16; o > 0; o >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, o);
+  const float rrms = rsqrtf(ss / (float)K + eps);
+  if (lane == 0) rrms_out[row] = __float2half(rrms);
+  bi = 0;
+  for (int kb = lane; kb < nkb; kb += 32, bi++) {
+    float amax = 0.f;
+#pragma unroll
+    for (int j = 0; j < 4; j++) { const __half2* h = reinterpret_cast<const __half2*>(&xbuf[bi][j]);
+#pragma unroll
+      for (int i = 0; i < 4; i++) { float2 f = __half22float2(h[i]); amax = fmaxf(amax, fmaxf(fabsf(f.x), fabsf(f.y))); } }
+    int b = amax > 0.f ? ((int)ceilf(__log2f(amax * (1.0f / 448.0f))) + 127) : 0; b = b < 0 ? 0 : (b > 254 ? 254 : b);
+    float inv = amax > 0.f ? exp2f((float)(127 - b)) : 0.f;
+    sfa[(row >> 7) * (long long)ntx * 512 + (kb >> 2) * 512 + (iy % 32) * 16 + (iy >> 5) * 4 + (kb & 3)] = (unsigned char)b;
+#pragma unroll
+    for (int j = 0; j < 4; j++) { const __half2* h = reinterpret_cast<const __half2*>(&xbuf[bi][j]);
+      uint2 out; unsigned short* os = reinterpret_cast<unsigned short*>(&out);
+#pragma unroll
+      for (int i = 0; i < 4; i++) { float2 f = __half22float2(h[i]); f.x *= inv; f.y *= inv; os[i] = __nv_fp8x2_e4m3(f).__x; }
       aqr[kb * 4 + j] = out; }
   }
 {% elif norm == 'swiglu' %}
@@ -183,7 +216,7 @@ __global__ void {{func_name}}_quant(const __half* __restrict__ a,
 // A [M,{{K}}]{{ ' e4m3 + a_scale (swizzled SFA)' if prequant else ' f16 (quantized internally)' }},
 // B [{{N}},{{K}}] e4m3 + b_scale (ue8m0 swizzled SFB, baked) -> D [M,{{N}}] f16.
 void {{func_name}}(const void* a_ptr, {% if prequant %}const void* ascale_ptr, {% endif %}{% if norm == 'rmsnorm' %}const void* gamma_ptr, {% endif %}{% if norm == 'swiglu' %}const void* rrms_ptr, {% endif %}const void* b_ptr, const void* bscale_ptr,
-                   const void* residual_ptr, void* out_ptr, int64_t M, cudaStream_t stream) {
+                   const void* residual_ptr, void* out_ptr, {% if norm == 'rms_out' %}void* rrms_out_ptr, {% endif %}int64_t M, cudaStream_t stream) {
   using namespace {{func_name}}_ns;
   const int N = {{N}}, K = {{K}}, nkb = K / 32, ntx = (nkb + 3) / 4; (void)nkb; (void)ntx;
   StrideA stride_A = cutlass::make_cute_packed_stride(StrideA{}, {static_cast<int>(M), K, 1});
@@ -207,6 +240,7 @@ void {{func_name}}(const void* a_ptr, {% if prequant %}const void* ascale_ptr, {
     {{func_name}}_quant<<<g, BLK, 0, stream>>>(reinterpret_cast<const __half*>(a_ptr),
 {% if norm == 'rmsnorm' %}                                               reinterpret_cast<const __half*>(gamma_ptr), {{eps}}f,
 {% endif %}{% if norm == 'swiglu' %}                                               reinterpret_cast<const __half*>(rrms_ptr),
+{% endif %}{% if norm == 'rms_out' %}                                               reinterpret_cast<__half*>(rrms_out_ptr), {{eps}}f,
 {% endif %}                                               reinterpret_cast<unsigned char*>(s_aq), s_sfa,
                                                (long long)M, nkb, ntx);
   }
@@ -236,13 +270,13 @@ void {{func_name}}(const void* a_ptr, {% if prequant %}const void* ascale_ptr, {
 FUNC_DECL_TEMPLATE = jinja2.Template(
     "\nvoid {{func_name}}(const void*, {% if prequant %}const void*, {% endif %}"
     "{% if norm == 'rmsnorm' %}const void*, {% endif %}{% if norm == 'swiglu' %}const void*, {% endif %}const void*, const void*, "
-    "const void*, void*, int64_t, cudaStream_t);\n"
+    "const void*, void*, {% if norm == 'rms_out' %}void*, {% endif %}int64_t, cudaStream_t);\n"
 )
 
 FUNC_CALL_TEMPLATE = jinja2.Template(
     """
 {{indent}}{{func_name}}(
-{{indent}}    {{a_ptr}}, {% if ascale_ptr %}{{ascale_ptr}}, {% endif %}{% if gamma_ptr %}{{gamma_ptr}}, {% endif %}{% if rrms_ptr %}{{rrms_ptr}}, {% endif %}{{b_ptr}}, {{bscale_ptr}}, {{residual_ptr}}, {{out_ptr}}, {{m_expr}}, stream
+{{indent}}    {{a_ptr}}, {% if ascale_ptr %}{{ascale_ptr}}, {% endif %}{% if gamma_ptr %}{{gamma_ptr}}, {% endif %}{% if rrms_ptr %}{{rrms_ptr}}, {% endif %}{{b_ptr}}, {{bscale_ptr}}, {{residual_ptr}}, {{out_ptr}}, {% if rrms_out_ptr %}{{rrms_out_ptr}}, {% endif %}{{m_expr}}, stream
 {{indent}});
 """
 )
@@ -297,10 +331,13 @@ def gen_function_call(func_attrs, indent="  "):
         rrms_ptr = ins[idx]._attrs["name"]; idx += 1
     residual_ptr = ins[idx]._attrs["name"] if func_attrs.get("has_residual", False) else "nullptr"
     out = func_attrs["outputs"][0]
+    rrms_out_ptr = None
+    if func_attrs.get("norm", "none") == "rms_out":
+        rrms_out_ptr = func_attrs["outputs"][1]._attrs["name"]
     m_expr = " * ".join(d._attrs["name"] for d in a._attrs["shape"][:-1]) or "1"
     return FUNC_CALL_TEMPLATE.render(
         indent=indent, func_name=func_attrs["name"],
         a_ptr=a._attrs["name"], ascale_ptr=ascale_ptr, gamma_ptr=gamma_ptr, rrms_ptr=rrms_ptr,
         b_ptr=b._attrs["name"], bscale_ptr=bscale._attrs["name"],
-        residual_ptr=residual_ptr, out_ptr=out._attrs["name"], m_expr=m_expr,
+        residual_ptr=residual_ptr, out_ptr=out._attrs["name"], rrms_out_ptr=rrms_out_ptr, m_expr=m_expr,
     )
