@@ -40,7 +40,7 @@ using LayoutC = cutlass::layout::RowMajor;
 // (qkv), N<=128 -> 128x128 (o/fc2/down). SM100 (Blackwell tcgen05, 1SM): MMA tile M must be
 // 128, N=128, K=64; cluster all-ones (1SM). Cluster 1x1x1 in both.
 using TileShapeMNK    = {{tile}};
-using ClusterShapeMNK = Shape<_1, _1, _1>;
+using ClusterShapeMNK = {{cluster}};
 constexpr int AlignA = 128 / cutlass::sizeof_bits<ElementA>::value;   // 16
 constexpr int AlignB = 128 / cutlass::sizeof_bits<ElementB>::value;   // 16
 constexpr int AlignC = 128 / cutlass::sizeof_bits<ElementOut>::value; // 8
@@ -188,17 +188,25 @@ def _tile_for_n(N):
 def _arch_config(func_attrs):
     from aitemplate.backend.target import Target
 
+    import os
+
     arch = Target.current()._arch
     if arch == "100":
         # Auto+Auto is the guaranteed-compatible SM100 pairing (cutlass example 70 ships it
-        # with a per-row fusion). ClusterShape<_1,_1,_1> forces the 1SM schedule under Auto,
-        # so MMA tile M=128 is valid. Switch to the explicit KernelTmaWarpSpecialized1SmSm100
-        # / TmaWarpSpecialized1Sm pair if per-shape control is needed later.
+        # with a per-row fusion). ClusterShape M parity selects the schedule under Auto:
+        # <_1,_1,_1> -> 1SM (MMA tile M=128), <_2,_1,_1> -> 2SM (MMA tile M=256, 2x MMA
+        # throughput). Our trunk M (batch*board) is always large, so 2SM can win at high batch;
+        # opt-in via AIT_FP8_GEMM_2SM=1 (default 1SM, which is safest across the batch range).
+        if os.environ.get("AIT_FP8_GEMM_2SM", "0") == "1":
+            tile, cluster = "Shape<_256, _128, _64>", "Shape<_2, _1, _1>"
+        else:
+            tile, cluster = "Shape<_128, _128, _64>", "Shape<_1, _1, _1>"
         return {
             "arch_tag": "Sm100",
             "epi_sched": "cutlass::epilogue::collective::EpilogueScheduleAuto",
             "mainloop_sched": "cutlass::gemm::collective::KernelScheduleAuto",
-            "tile": "Shape<_128, _128, _64>",
+            "tile": tile,
+            "cluster": cluster,
             "sched_arg": ", void",
         }
     return {
@@ -206,6 +214,7 @@ def _arch_config(func_attrs):
         "epi_sched": "cutlass::epilogue::TmaWarpSpecializedCooperative",
         "mainloop_sched": "cutlass::gemm::KernelTmaWarpSpecializedCooperativeFP8FastAccum",
         "tile": _tile_for_n(func_attrs["N"]),
+        "cluster": "Shape<_1, _1, _1>",
         "sched_arg": "",
     }
 
