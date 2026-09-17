@@ -225,12 +225,35 @@ void {{func_name}}(const void* a_ptr, {% if norm == 'rmsnorm' %}const void* gamm
   StrideD stride_D = cutlass::make_cute_packed_stride(StrideD{}, {static_cast<int>(M), N, 1});
   auto layout_SFA = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFA(cute::make_shape(static_cast<int>(M), N, K, 1));
   auto layout_SFB = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(cute::make_shape(static_cast<int>(M), N, K, 1));
-  // static workspaces: quantized activation (e4m3) + its swizzled SFA (ue8m0)
-  static DataA* s_aq = nullptr; static size_t s_aq_m = 0;
-  static unsigned char* s_sfa = nullptr; static size_t s_sfa_sz = 0;
-  if ((size_t)M > s_aq_m) { if (s_aq) cudaFree(s_aq); cudaMalloc(&s_aq, sizeof(DataA) * (size_t)M * K); s_aq_m = (size_t)M; }
-  size_t sfa_need = (size_t)cute::size(cute::filter_zeros(layout_SFA));
-  if (sfa_need > s_sfa_sz) { if (s_sfa) cudaFree(s_sfa); cudaMalloc(&s_sfa, sfa_need); s_sfa_sz = sfa_need; }
+  cutlass::KernelHardwareInfo hw_info;
+  // Static workspaces (quantized activation e4m3 + swizzled SFA ue8m0 + cutlass workspace),
+  // allocated ONCE at the built max M ({{max_m}}) and NEVER freed/realloc'd. Sizing at max M
+  // (not per-call M) keeps the pointers stable so they can be safely baked into a captured CUDA
+  // graph: a later, larger batch would otherwise cudaFree a pointer a graph already captured
+  // (use-after-free on replay). Max-M buffers cover every M in the built [1,{{max_m}}] range;
+  // a per-call-M layout indexes a prefix of them.
+  static DataA* s_aq = nullptr;
+  static unsigned char* s_sfa = nullptr;
+  static uint8_t* s_ws = nullptr;
+  if (s_aq == nullptr) {
+    const int MM = {{max_m}};
+    cudaMalloc(&s_aq, sizeof(DataA) * (size_t)MM * K);
+    auto lsfa_max = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFA(cute::make_shape(MM, N, K, 1));
+    cudaMalloc(&s_sfa, (size_t)cute::size(cute::filter_zeros(lsfa_max)));
+    typename Gemm::Arguments size_args{
+        cutlass::gemm::GemmUniversalMode::kGemm, {MM, N, K, 1},
+        {reinterpret_cast<const DataA*>(s_aq), cutlass::make_cute_packed_stride(StrideA{}, {MM, K, 1}),
+         reinterpret_cast<const DataA*>(b_ptr), stride_B,
+         reinterpret_cast<const ScaleT*>(s_sfa), lsfa_max,
+         reinterpret_cast<const ScaleT*>(bscale_ptr),
+         Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(cute::make_shape(MM, N, K, 1))},
+        {{'{'}}{1.0f, 0.0f}, reinterpret_cast<const ElementOut*>(out_ptr),
+         cutlass::make_cute_packed_stride(StrideC{}, {MM, N, 1}),
+         reinterpret_cast<ElementOut*>(out_ptr),
+         cutlass::make_cute_packed_stride(StrideD{}, {MM, N, 1}){{'}'}},
+        hw_info};
+    cudaMalloc(&s_ws, Gemm::get_workspace_size(size_args));
+  }
   {
     const int BLK = 128; unsigned int g = (unsigned int)((M + (BLK >> 5) - 1) / (BLK >> 5));
     {{func_name}}_quant<<<g, BLK, 0, stream>>>(reinterpret_cast<const __half*>(a_ptr),
@@ -245,7 +268,6 @@ void {{func_name}}(const void* a_ptr, {% if norm == 'rmsnorm' %}const void* gamm
   }
   const DataA* a_e4m3 = s_aq;
   const ScaleT* a_sf = reinterpret_cast<const ScaleT*>(s_sfa);
-  cutlass::KernelHardwareInfo hw_info;
   typename Gemm::Arguments arguments{
       cutlass::gemm::GemmUniversalMode::kGemm, {static_cast<int>(M), N, K, 1},
       {a_e4m3, stride_A, reinterpret_cast<const DataA*>(b_ptr), stride_B,
@@ -255,9 +277,6 @@ void {{func_name}}(const void* a_ptr, {% if norm == 'rmsnorm' %}const void* gamm
        reinterpret_cast<ElementOut*>(out_ptr), stride_D{{'}'}},
       hw_info};
   Gemm gemm_op;
-  static uint8_t* s_ws = nullptr; static size_t s_ws_sz = 0;
-  size_t need = Gemm::get_workspace_size(arguments);
-  if (need > s_ws_sz) { if (s_ws) cudaFree(s_ws); cudaMalloc(&s_ws, need); s_ws_sz = need; }
   AIT_CUTLASS_CHECK(gemm_op.can_implement(arguments));
   AIT_CUTLASS_CHECK(gemm_op.initialize(arguments, s_ws, stream));
   AIT_CUTLASS_CHECK(gemm_op.run(stream));
@@ -294,11 +313,16 @@ def gen_function(func_attrs):
     K = func_attrs["K"]
     nkb = K // 32
     relu_stmt = "av = fmaxf(av, 0.f); bv = fmaxf(bv, 0.f);" if func_attrs.get("relu") else ""
+    # max M (rows) over the built dynamic range = product of the a-shape[:-1] upper bounds.
+    # Used to size the static workspaces ONCE (no realloc -> CUDA-graph-safe pointers).
+    max_m = 1
+    for d in func_attrs["inputs"][0]._attrs["shape"][:-1]:
+        max_m *= d._attrs["values"][-1]
     return FUNC_TEMPLATE.render(
         func_name=func_attrs["name"], N=func_attrs["N"], K=K,
         has_residual=func_attrs.get("has_residual", False),
         norm=func_attrs.get("norm", "none"), relu_stmt=relu_stmt,
-        NCHUNK=(nkb + 31) // 32, eps=func_attrs.get("eps", 1e-6),
+        NCHUNK=(nkb + 31) // 32, eps=func_attrs.get("eps", 1e-6), max_m=max_m,
         tile=tile, cluster=cluster,
     )
 
