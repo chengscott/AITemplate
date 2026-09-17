@@ -66,9 +66,14 @@ using LayoutSFA = typename GemmKernel::CollectiveMainloop::LayoutSFA;
 using LayoutSFB = typename GemmKernel::CollectiveMainloop::LayoutSFB;
 using Sm1xxBlkScaledConfig = typename GemmKernel::CollectiveMainloop::Sm1xxBlkScaledConfig;
 
-// Quantize a_f16 [M,K] -> aq e4m3 [M,K] + sfa (ue8m0, swizzled cuBLAS layout). One warp/row,
-// each lane owns 32-element K-blocks (nkb of them). e8m0 = round-up-pow2(amax/448).
-__global__ void {{func_name}}_quant(const __half* __restrict__ a, unsigned char* __restrict__ aq,
+// Quantize activation -> aq e4m3 [M,K] + sfa (ue8m0, swizzled). One warp/row, each lane owns
+// 32-elem K-blocks (nkb). e8m0 = round-up-pow2(amax/448). norm=='rmsnorm': fold RMSNorm+gamma
+// (+relu) into the quantize (one read of the raw input; holds the row in NCHUNK uint4/lane),
+// eliminating the separate norm kernel + its f16 output round-trip. norm=='none': quantize a
+// directly. (This keeps sfa a STATIC workspace inside the gemm op -- no dynamic SF graph tensor.)
+__global__ void {{func_name}}_quant(const __half* __restrict__ a,
+{% if norm == 'rmsnorm' %}                                    const __half* __restrict__ gamma, float eps,
+{% endif %}                                    unsigned char* __restrict__ aq,
                                     unsigned char* __restrict__ sfa, long long rows, int nkb, int ntx) {
   const int warps_per_cta = blockDim.x >> 5;
   const long long row = (long long)blockIdx.x * warps_per_cta + (threadIdx.x >> 5);
@@ -77,29 +82,61 @@ __global__ void {{func_name}}_quant(const __half* __restrict__ a, unsigned char*
   const long long K = (long long)nkb * 32;
   const uint4* ar = reinterpret_cast<const uint4*>(a + row * K);   // 8 half / uint4
   uint2* aqr = reinterpret_cast<uint2*>(aq + row * K);             // 8 e4m3 / uint2
+  const long long iy = row & 127;
+{% if norm == 'rmsnorm' %}
+  const uint4* gr = reinterpret_cast<const uint4*>(gamma);
+  uint4 xbuf[{{NCHUNK}}][4]; float ss = 0.f;
+  int bi = 0;
+  for (int kb = lane; kb < nkb; kb += 32, bi++) {
+#pragma unroll
+    for (int j = 0; j < 4; j++) { uint4 q = ar[kb * 4 + j]; xbuf[bi][j] = q; const __half2* h = reinterpret_cast<const __half2*>(&q);
+#pragma unroll
+      for (int i = 0; i < 4; i++) { float2 f = __half22float2(h[i]); ss += f.x * f.x + f.y * f.y; } }
+  }
+#pragma unroll
+  for (int o = 16; o > 0; o >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, o);
+  const float rrms = rsqrtf(ss / (float)K + eps);
+  bi = 0;
+  for (int kb = lane; kb < nkb; kb += 32, bi++) {
+    float amax = 0.f; uint4 nb[4];
+#pragma unroll
+    for (int j = 0; j < 4; j++) {
+      const __half2* h = reinterpret_cast<const __half2*>(&xbuf[bi][j]);
+      uint4 g = gr[kb * 4 + j]; const __half2* gh = reinterpret_cast<const __half2*>(&g);
+      __half2* nh = reinterpret_cast<__half2*>(&nb[j]);
+#pragma unroll
+      for (int i = 0; i < 4; i++) { float2 f = __half22float2(h[i]); float2 gf = __half22float2(gh[i]);
+        float av = f.x * rrms * gf.x, bv = f.y * rrms * gf.y; {{relu_stmt}}
+        amax = fmaxf(amax, fmaxf(fabsf(av), fabsf(bv))); nh[i] = __float22half2_rn(make_float2(av, bv)); }
+    }
+    int b = amax > 0.f ? ((int)ceilf(__log2f(amax * (1.0f / 448.0f))) + 127) : 0; b = b < 0 ? 0 : (b > 254 ? 254 : b);
+    float inv = amax > 0.f ? exp2f((float)(127 - b)) : 0.f;
+    sfa[(row >> 7) * (long long)ntx * 512 + (kb >> 2) * 512 + (iy % 32) * 16 + (iy >> 5) * 4 + (kb & 3)] = (unsigned char)b;
+#pragma unroll
+    for (int j = 0; j < 4; j++) { const __half2* zh = reinterpret_cast<const __half2*>(&nb[j]);
+      uint2 out; unsigned short* os = reinterpret_cast<unsigned short*>(&out);
+#pragma unroll
+      for (int i = 0; i < 4; i++) { float2 f = __half22float2(zh[i]); f.x *= inv; f.y *= inv; os[i] = __nv_fp8x2_e4m3(f).__x; }
+      aqr[kb * 4 + j] = out; }
+  }
+{% else %}
   for (int kb = lane; kb < nkb; kb += 32) {
     uint4 buf[4]; float amax = 0.f;
 #pragma unroll
-    for (int j = 0; j < 4; j++) {
-      uint4 q = ar[kb * 4 + j]; buf[j] = q;
-      const __half2* h = reinterpret_cast<const __half2*>(&q);
+    for (int j = 0; j < 4; j++) { uint4 q = ar[kb * 4 + j]; buf[j] = q; const __half2* h = reinterpret_cast<const __half2*>(&q);
 #pragma unroll
-      for (int i = 0; i < 4; i++) { float2 f = __half22float2(h[i]); amax = fmaxf(amax, fmaxf(fabsf(f.x), fabsf(f.y))); }
-    }
-    int b = amax > 0.f ? ((int)ceilf(__log2f(amax * (1.0f / 448.0f))) + 127) : 0;
-    b = b < 0 ? 0 : (b > 254 ? 254 : b);
+      for (int i = 0; i < 4; i++) { float2 f = __half22float2(h[i]); amax = fmaxf(amax, fmaxf(fabsf(f.x), fabsf(f.y))); } }
+    int b = amax > 0.f ? ((int)ceilf(__log2f(amax * (1.0f / 448.0f))) + 127) : 0; b = b < 0 ? 0 : (b > 254 ? 254 : b);
     float inv = amax > 0.f ? exp2f((float)(127 - b)) : 0.f;
-    const long long iy = row & 127;
     sfa[(row >> 7) * (long long)ntx * 512 + (kb >> 2) * 512 + (iy % 32) * 16 + (iy >> 5) * 4 + (kb & 3)] = (unsigned char)b;
 #pragma unroll
-    for (int j = 0; j < 4; j++) {
-      const __half2* h = reinterpret_cast<const __half2*>(&buf[j]);
+    for (int j = 0; j < 4; j++) { const __half2* h = reinterpret_cast<const __half2*>(&buf[j]);
       uint2 out; unsigned short* os = reinterpret_cast<unsigned short*>(&out);
 #pragma unroll
       for (int i = 0; i < 4; i++) { float2 f = __half22float2(h[i]); f.x *= inv; f.y *= inv; os[i] = __nv_fp8x2_e4m3(f).__x; }
-      aqr[kb * 4 + j] = out;
-    }
+      aqr[kb * 4 + j] = out; }
   }
+{% endif %}
 }
 
 #ifndef AIT_CUTLASS_CHECK
@@ -113,7 +150,7 @@ __global__ void {{func_name}}_quant(const __half* __restrict__ a, unsigned char*
 
 // A [M,{{K}}]{{ ' e4m3 + a_scale (swizzled SFA)' if prequant else ' f16 (quantized internally)' }},
 // B [{{N}},{{K}}] e4m3 + b_scale (ue8m0 swizzled SFB, baked) -> D [M,{{N}}] f16.
-void {{func_name}}(const void* a_ptr, {% if prequant %}const void* ascale_ptr, {% endif %}const void* b_ptr, const void* bscale_ptr,
+void {{func_name}}(const void* a_ptr, {% if prequant %}const void* ascale_ptr, {% endif %}{% if norm == 'rmsnorm' %}const void* gamma_ptr, {% endif %}const void* b_ptr, const void* bscale_ptr,
                    const void* residual_ptr, void* out_ptr, int64_t M, cudaStream_t stream) {
   using namespace {{func_name}}_ns;
   const int N = {{N}}, K = {{K}}, nkb = K / 32, ntx = (nkb + 3) / 4; (void)nkb; (void)ntx;
@@ -136,7 +173,8 @@ void {{func_name}}(const void* a_ptr, {% if prequant %}const void* ascale_ptr, {
   {
     const int BLK = 128; unsigned int g = (unsigned int)((M + (BLK >> 5) - 1) / (BLK >> 5));
     {{func_name}}_quant<<<g, BLK, 0, stream>>>(reinterpret_cast<const __half*>(a_ptr),
-                                               reinterpret_cast<unsigned char*>(s_aq), s_sfa,
+{% if norm == 'rmsnorm' %}                                               reinterpret_cast<const __half*>(gamma_ptr), {{eps}}f,
+{% endif %}                                               reinterpret_cast<unsigned char*>(s_aq), s_sfa,
                                                (long long)M, nkb, ntx);
   }
   const DataA* a_e4m3 = s_aq;
@@ -163,14 +201,15 @@ void {{func_name}}(const void* a_ptr, {% if prequant %}const void* ascale_ptr, {
 )
 
 FUNC_DECL_TEMPLATE = jinja2.Template(
-    "\nvoid {{func_name}}(const void*, {% if prequant %}const void*, {% endif %}const void*, const void*, "
+    "\nvoid {{func_name}}(const void*, {% if prequant %}const void*, {% endif %}"
+    "{% if norm == 'rmsnorm' %}const void*, {% endif %}const void*, const void*, "
     "const void*, void*, int64_t, cudaStream_t);\n"
 )
 
 FUNC_CALL_TEMPLATE = jinja2.Template(
     """
 {{indent}}{{func_name}}(
-{{indent}}    {{a_ptr}}, {% if ascale_ptr %}{{ascale_ptr}}, {% endif %}{{b_ptr}}, {{bscale_ptr}}, {{residual_ptr}}, {{out_ptr}}, {{m_expr}}, stream
+{{indent}}    {{a_ptr}}, {% if ascale_ptr %}{{ascale_ptr}}, {% endif %}{% if gamma_ptr %}{{gamma_ptr}}, {% endif %}{{b_ptr}}, {{bscale_ptr}}, {{residual_ptr}}, {{out_ptr}}, {{m_expr}}, stream
 {{indent}});
 """
 )
@@ -187,35 +226,45 @@ def _tile_cluster():
 @registry.reg("cuda.gemm_rcr_mxfp8.gen_function")
 def gen_function(func_attrs):
     tile, cluster = _tile_cluster()
+    K = func_attrs["K"]
+    nkb = K // 32
+    relu_stmt = "av = fmaxf(av, 0.f); bv = fmaxf(bv, 0.f);" if func_attrs.get("relu") else ""
     return FUNC_TEMPLATE.render(
-        func_name=func_attrs["name"], N=func_attrs["N"], K=func_attrs["K"],
+        func_name=func_attrs["name"], N=func_attrs["N"], K=K,
         has_residual=func_attrs.get("has_residual", False),
-        prequant=func_attrs.get("has_prequant", False), tile=tile, cluster=cluster,
+        prequant=func_attrs.get("has_prequant", False),
+        norm=func_attrs.get("norm", "none"), relu_stmt=relu_stmt,
+        NCHUNK=(nkb + 31) // 32, eps=func_attrs.get("eps", 1e-6),
+        tile=tile, cluster=cluster,
     )
 
 
 @registry.reg("cuda.gemm_rcr_mxfp8.func_decl")
 def gen_function_decl(func_attrs):
     return FUNC_DECL_TEMPLATE.render(
-        func_name=func_attrs["name"], prequant=func_attrs.get("has_prequant", False)
+        func_name=func_attrs["name"], prequant=func_attrs.get("has_prequant", False),
+        norm=func_attrs.get("norm", "none"),
     )
 
 
 @registry.reg("cuda.gemm_rcr_mxfp8.func_call")
 def gen_function_call(func_attrs, indent="  "):
+    # inputs: [a, b, b_scale] + [a_scale?] + [gamma?] + [residual?]
     ins = func_attrs["inputs"]
     a, b, bscale = ins[0], ins[1], ins[2]
     idx = 3
     ascale_ptr = None
     if func_attrs.get("has_prequant", False):
-        ascale_ptr = ins[idx]._attrs["name"]
-        idx += 1
+        ascale_ptr = ins[idx]._attrs["name"]; idx += 1
+    gamma_ptr = None
+    if func_attrs.get("norm", "none") == "rmsnorm":
+        gamma_ptr = ins[idx]._attrs["name"]; idx += 1
     residual_ptr = ins[idx]._attrs["name"] if func_attrs.get("has_residual", False) else "nullptr"
     out = func_attrs["outputs"][0]
     m_expr = " * ".join(d._attrs["name"] for d in a._attrs["shape"][:-1]) or "1"
     return FUNC_CALL_TEMPLATE.render(
         indent=indent, func_name=func_attrs["name"],
-        a_ptr=a._attrs["name"], ascale_ptr=ascale_ptr,
+        a_ptr=a._attrs["name"], ascale_ptr=ascale_ptr, gamma_ptr=gamma_ptr,
         b_ptr=b._attrs["name"], bscale_ptr=bscale._attrs["name"],
         residual_ptr=residual_ptr, out_ptr=out._attrs["name"], m_expr=m_expr,
     )
