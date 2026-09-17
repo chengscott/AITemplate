@@ -91,6 +91,11 @@ class ModelBase {
     if (graph_exec_ != nullptr) {
       GraphExecDestroy(graph_exec_);
     }
+    for (auto& kv : graph_exec_cache_) {
+      if (kv.second != nullptr) {
+        GraphExecDestroy(kv.second);
+      }
+    }
   }
 
   ModelBase(ModelBase&&) = delete;
@@ -216,7 +221,22 @@ class ModelBase {
     return GetDeviceSuccess();
   }
 
-  void RunAsGraph(StreamType stream) {
+  // FNV-1a hash of the current input shapes -- the key for the captured-graph
+  // cache. A captured graph bakes shape-dependent launch params in, so it is
+  // valid only for the shape it was recorded at; keying by shape lets us capture
+  // once per distinct shape and replay thereafter.
+  int64_t GraphShapeKey() {
+    uint64_t key = 1469598103934665603ULL;
+    for (size_t i = 0; i < num_inputs_; ++i) {
+      for (const auto& d : params_[i].shape_ptrs) {
+        key = (key ^ static_cast<uint64_t>(d.GetValue())) * 1099511628211ULL;
+      }
+    }
+    return static_cast<int64_t>(key);
+  }
+
+  // BeginCapture -> RunImpl -> EndCapture -> instantiate; returns the executable.
+  GraphExecType CaptureGraphExec() {
     DEVICE_CHECK(StreamBeginCapture(graph_capture_stream_, /*global=*/false));
     try {
       static_cast<ModelType*>(this)->RunImpl(graph_capture_stream_);
@@ -230,25 +250,48 @@ class ModelBase {
       }
       throw;
     }
-
-    // The following function ends the capture and creates a graph
-    // inside a unique_ptr that cleans up it when it goes out of scope.
-    // Note that it throws an exception if EndCapture fails.
+    // Ends the capture and creates a graph in a unique_ptr that cleans itself up
+    // when it goes out of scope. Throws an exception if EndCapture fails.
     auto graph = RAII_EndCaptureAndCreateGraph(
         [this](GraphType* graph_ptr) { return EndCapture(graph_ptr); });
+    GraphExecType exec = nullptr;
+    DEVICE_CHECK(GraphInstantiate(&exec, graph.get()));
+    return exec;
+  }
 
-    if (graph_exec_ == nullptr) {
-      DEVICE_CHECK(GraphInstantiate(&graph_exec_, graph.get()));
-    } else if (
-        GraphExecUpdate(graph_exec_, graph.get()) != GetDeviceSuccess()) {
-      // Consume the last cuda error, which may affect the next GraphExecLaunch
-      // call.
-      GetLastError();
-      DEVICE_CHECK(GraphExecDestroy(graph_exec_));
-      DEVICE_CHECK(GraphInstantiate(&graph_exec_, graph.get()));
+  void RunAsGraph(StreamType stream) {
+    // Capture-once, replay-many: reuse the executable captured for the current
+    // input shape instead of re-recording (BeginCapture/RunImpl/EndCapture) every
+    // call. Correct only because the caller reuses stable input/output buffers --
+    // a captured graph bakes those pointers in. A static-shape engine has exactly
+    // one shape, so it uses the single graph_exec_ (no per-call hashing); a
+    // dynamic-shape engine keys a captured graph per shape.
+    if (is_dynamic_shape_ < 0) {
+      is_dynamic_shape_ = 0;
+      for (size_t i = 0; i < num_inputs_ && !is_dynamic_shape_; ++i) {
+        for (const auto& d : params_[i].shape_ptrs) {
+          if (d.IsDynamic()) {
+            is_dynamic_shape_ = 1;
+            break;
+          }
+        }
+      }
     }
 
-    DEVICE_CHECK(GraphExecLaunch(graph_exec_, stream));
+    if (!is_dynamic_shape_) {
+      if (graph_exec_ == nullptr) {
+        graph_exec_ = CaptureGraphExec();
+      }
+      DEVICE_CHECK(GraphExecLaunch(graph_exec_, stream));
+      return;
+    }
+
+    const int64_t key = GraphShapeKey();
+    auto cached = graph_exec_cache_.find(key);
+    if (cached == graph_exec_cache_.end()) {
+      cached = graph_exec_cache_.emplace(key, CaptureGraphExec()).first;
+    }
+    DEVICE_CHECK(GraphExecLaunch(cached->second, stream));
   }
 
  protected:
@@ -298,6 +341,11 @@ class ModelBase {
       return *value_;
     }
 
+    // True if this dim can take more than one value across runs (an IntVar).
+    bool IsDynamic() const {
+      return lower_bound_ != upper_bound_;
+    }
+
    private:
     int64_t lower_bound_;
     int64_t upper_bound_;
@@ -317,6 +365,11 @@ class ModelBase {
   std::vector<ParamInfo> params_;
 
   GraphExecType graph_exec_ = nullptr;
+  // Captured graph executables for a dynamic-shape engine, one per distinct input
+  // shape (see RunAsGraph). A static-shape engine uses graph_exec_ instead.
+  std::unordered_map<int64_t, GraphExecType> graph_exec_cache_;
+  // -1 = not yet determined, 0 = static input shapes, 1 = dynamic (has an IntVar).
+  int is_dynamic_shape_ = -1;
   StreamType graph_capture_stream_;
 
   std::unordered_map<std::string, const void**> constant_name_to_ptr_;
