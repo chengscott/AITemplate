@@ -1,7 +1,9 @@
-#  SM100 MXFP8 (block-scaled e4m3) gemm (RCR): A/B are e4m3 data + per-32-element ue8m0 block
-#  scales (SFA activation, SFB weight, both in the swizzled cuBLAS layout). Block scales are
-#  applied inside the tcgen05 UMMA, so D_f16 = (A@B^T) + residual (bias-free trunk). No per-row
-#  alpha / dequant kernel. A [M,K] e4m3, B [N,K] e4m3, residual [M,N] f16 (optional).
+#  SM100 MXFP8 (block-scaled e4m3) gemm (RCR) with the ACTIVATION quantize folded into the op:
+#  takes the f16 activation A [M,K] and, inside the emitted function, quantizes it to e4m3 +
+#  per-32-element ue8m0 block scales (SFA, swizzled) into static workspace buffers, then runs the
+#  tcgen05 block-scaled UMMA against the e4m3 weight B [N,K] + its baked swizzled ue8m0 scales
+#  (SFB). Block scales apply inside the MMA -> D_f16 = (A@B^T) + residual (bias-free trunk).
+#  Keeping SFA a static device workspace (not a graph tensor) avoids a dynamic-M swizzled shape.
 from aitemplate import backend
 from aitemplate.backend import registry
 from aitemplate.compiler.base import IntImm, Operator, Tensor
@@ -10,22 +12,23 @@ from aitemplate.compiler.base import IntImm, Operator, Tensor
 
 
 class gemm_rcr_mxfp8(Operator):
-    """(A e4m3+SFA, B e4m3+SFB) -> D f16 = (A@B^T) + residual, SM100 block-scaled gemm."""
+    """(A f16, B e4m3, B_sf ue8m0) -> D f16 = (A@B^T)+residual; SM100 block-scaled gemm."""
 
     def __init__(self) -> None:
         super().__init__()
         self._attrs["op"] = "gemm_rcr_mxfp8"
         self._attrs["has_profiler"] = False
 
-    def __call__(self, a, sfa, b, sfb, residual=None):
-        # a [M,K] e4m3, sfa ue8m0 (swizzled), b [N,K] e4m3, sfb ue8m0 (swizzled).
+    def __call__(self, a, b, b_scale, residual=None):
+        # a [M,K] f16 (quantized to e4m3+SFA internally), b [N,K] e4m3, b_scale ue8m0 SFB
+        # (swizzled, baked at export). K % 32 == 0 (SFVecSize).
         K = a._attrs["shape"][-1]._attrs["values"][0]
         Kb = b._attrs["shape"][1]._attrs["values"][0]
         Nn = b._attrs["shape"][0]._attrs["values"][0]
         assert K == Kb, f"gemm_rcr_mxfp8 K mismatch {K} vs {Kb}"
         assert K % 32 == 0, f"gemm_rcr_mxfp8 needs K % 32 == 0 (SFVecSize), got {K}"
         self._attrs["N"], self._attrs["K"] = Nn, K
-        inputs = [a, sfa, b, sfb]
+        inputs = [a, b, b_scale]
         if residual is not None:
             inputs.append(residual)
         self._attrs["has_residual"] = residual is not None
