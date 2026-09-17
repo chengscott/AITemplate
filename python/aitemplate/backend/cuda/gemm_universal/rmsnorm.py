@@ -1,8 +1,9 @@
 #  Backend codegen for the native `rmsnorm` op: a single-pass, one-warp-per-row fused
 #  RMSNorm kernel (Z = RMSNorm(X) * gamma [+ relu]). fp32 accumulation matches the reference.
-#  fp8_out variant: also quantizes the output to e4m3 per-row IN-KERNEL (holds z in a
-#  register, warp-reduces its absmax, writes e4m3 + f32 scale), so a downstream fp8 gemm
-#  needs no separate quantize kernel. Requires C <= 256 (VECS<=32 -> 1 uint4 chunk per lane).
+#  fp8_out variant: also quantizes the output to e4m3 per-row IN-KERNEL (holds z in
+#  registers, warp-reduces its absmax, writes e4m3 + f32 scale), so a downstream fp8 gemm
+#  needs no separate quantize kernel. Each lane holds NCHUNK=ceil((C/8)/32) uint4 chunks
+#  (baked from the static C), so any C that is a multiple of 8 works.
 import jinja2
 
 from aitemplate.backend import registry
@@ -43,42 +44,51 @@ __global__ void {{func_name}}_kernel(const __half* __restrict__ x,
   const float rrms = rsqrtf(ss / (float)C + eps);
 
 {% if fp8_out %}
-  // compute z into a register uint4, warp-reduce its absmax, quantize -> e4m3 (VECS<=32).
-  uint4 zq; float amax = 0.f;
-  const bool active = (lane < VECS);
-  if (active) {
-    uint4 q = xr[lane];
-    uint4 g = gr[lane];
-    __half2* h = reinterpret_cast<__half2*>(&q);
-    const __half2* gh = reinterpret_cast<const __half2*>(&g);
+  // compute z chunks into registers, warp-reduce the row's absmax, quantize -> e4m3.
+  // NCHUNK = ceil(VECS/32) uint4 per lane (baked from C), so any C (multiple of 8) works.
+  uint4 zq[{{NCHUNK}}]; float amax = 0.f;
 #pragma unroll
-    for (int i = 0; i < 4; i++) {
-      float2 f = __half22float2(h[i]);
-      float2 gf = __half22float2(gh[i]);
-      float a = f.x * rrms * gf.x;
-      float b = f.y * rrms * gf.y;
-      {{relu_stmt}}
-      amax = fmaxf(amax, fmaxf(fabsf(a), fabsf(b)));
-      h[i] = __float22half2_rn(make_float2(a, b));
+  for (int c = 0; c < {{NCHUNK}}; c++) {
+    const int v = lane + c * 32;
+    if (v < VECS) {
+      uint4 q = xr[v];
+      uint4 g = gr[v];
+      __half2* h = reinterpret_cast<__half2*>(&q);
+      const __half2* gh = reinterpret_cast<const __half2*>(&g);
+#pragma unroll
+      for (int i = 0; i < 4; i++) {
+        float2 f = __half22float2(h[i]);
+        float2 gf = __half22float2(gh[i]);
+        float a = f.x * rrms * gf.x;
+        float b = f.y * rrms * gf.y;
+        {{relu_stmt}}
+        amax = fmaxf(amax, fmaxf(fabsf(a), fabsf(b)));
+        h[i] = __float22half2_rn(make_float2(a, b));
+      }
+      zq[c] = q;
     }
-    zq = q;
   }
 #pragma unroll
   for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
   const float sc = amax * (1.0f / 448.0f);
   const float inv = sc > 0.f ? (1.0f / sc) : 0.f;
   if (lane == 0) scale[row] = sc > 0.f ? sc : 1.0f;
-  if (active) {
-    const __half2* zh = reinterpret_cast<const __half2*>(&zq);
-    uint2 out;
-    unsigned short* os = reinterpret_cast<unsigned short*>(&out);
+  uint2* outr = reinterpret_cast<uint2*>(xq + row * (long long)C);
 #pragma unroll
-    for (int i = 0; i < 4; i++) {
-      float2 f = __half22float2(zh[i]);
-      f.x *= inv; f.y *= inv;
-      os[i] = __nv_fp8x2_e4m3(f).__x;
+  for (int c = 0; c < {{NCHUNK}}; c++) {
+    const int v = lane + c * 32;
+    if (v < VECS) {
+      const __half2* zh = reinterpret_cast<const __half2*>(&zq[c]);
+      uint2 out;
+      unsigned short* os = reinterpret_cast<unsigned short*>(&out);
+#pragma unroll
+      for (int i = 0; i < 4; i++) {
+        float2 f = __half22float2(zh[i]);
+        f.x *= inv; f.y *= inv;
+        os[i] = __nv_fp8x2_e4m3(f).__x;
+      }
+      outr[v] = out;
     }
-    reinterpret_cast<uint2*>(xq + row * (long long)C)[lane] = out;
   }
 {% else %}
   uint4* zr = reinterpret_cast<uint4*>(z + row * (long long)C);
@@ -139,10 +149,14 @@ def rmsnorm_gen_function(func_attrs):
     # optional fused relu on the output (RMSNorm -> relu -> gemm): folds the relu
     # into the norm kernel so it isn't a standalone elementwise pass.
     relu_stmt = "a = fmaxf(a, 0.f); b = fmaxf(b, 0.f);" if func_attrs.get("relu") else ""
+    # NCHUNK = ceil((C/8)/32) uint4 chunks each lane holds for the fp8_out quantize pass
+    # (baked from the static channel count C), so C need not be <= 256.
+    C = func_attrs["inputs"][0]._attrs["shape"][-1]._attrs["values"][0]
     return FUNC_TEMPLATE.render(
         func_name=func_attrs["name"],
         relu_stmt=relu_stmt,
         fp8_out=func_attrs.get("fp8_out", False),
+        NCHUNK=((C >> 3) + 31) // 32,
     )
 
 

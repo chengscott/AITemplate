@@ -38,7 +38,7 @@ class rmsnorm(Operator):
         if self._attrs["fp8_out"]:
             from aitemplate.compiler.base import IntImm
 
-            assert C <= 256, f"rmsnorm fp8_out needs C <= 256, got {C}"
+            # C may be any multiple of 8: the kernel holds ceil((C/8)/32) uint4 chunks per lane.
             xq = Tensor(list(x._attrs["shape"]), src_ops={self}, dtype="float8_e4m3")
             scale = Tensor(
                 list(x._attrs["shape"][:-1]) + [IntImm(1)],
