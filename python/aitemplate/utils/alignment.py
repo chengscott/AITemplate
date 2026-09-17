@@ -32,6 +32,10 @@ def get_alignments(dtype: str) -> List[int]:
         return [8, 4, 2, 1]
     elif dtype in ("float", "float32"):
         return [4, 2, 1]
+    elif dtype == "float8_e4m3":
+        # SM90 fp8 WGMMA TMA wants 16-elem (16-byte) alignment; alignx kernels
+        # cover the smaller ones for unaligned K.
+        return [16, 8, 4, 2, 1]
     else:
         raise NotImplementedError(f"unsupported {dtype=} for alignments")
 
@@ -69,6 +73,8 @@ def valid_alignment(align: int, dtype: str) -> bool:
     if dtype in ("float16", "bfloat16"):
         return align % 2 == 0
     elif dtype in ("float", "float32"):
+        return True
+    elif dtype == "float8_e4m3":
         return True
     else:
         raise NotImplementedError(f"unsupported {dtype=} for valid_alignment")

@@ -23,12 +23,14 @@ DTYPE_TO_CUDATYPE: Dict[str, str] = {
     "float32": "float",
     "float": "float",
     "int64": "int64_t",
+    "float8_e4m3": "cutlass::float_e4m3_t",
 }
 
 
 DTYPE_TO_CUTLASSTYPE: Dict[str, str] = {
     "float16": "cutlass::half_t",
     "float": "float",
+    "float8_e4m3": "cutlass::float_e4m3_t",
 }
 
 

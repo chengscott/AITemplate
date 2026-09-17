@@ -58,6 +58,7 @@ class GPUBackendSpec(BackendSpec):
             "int64": "int64_t",
             "int32": "int32_t",
             "bool": "bool",
+            "float8_e4m3": "cutlass::float_e4m3_t",
         }
     )
 
@@ -73,6 +74,7 @@ class GPUBackendSpec(BackendSpec):
             "int32_t": 4,
             "float": 4,
             "bool": 1,
+            "cutlass::float_e4m3_t": 1,
             "uint4": 16,
             "uint2": 8,
             "uint": 4,
@@ -498,6 +500,7 @@ using bfloat16_2 = nv_bfloat162;
             "bfloat16": "cutlass::bfloat16_t",
             "float32": "float",
             "float": "float",
+            "float8_e4m3": "cutlass::float_e4m3_t",
         }
     )
 

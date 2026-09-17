@@ -25,6 +25,7 @@ _DTYPE2BYTE = {
     "int32": 4,
     "int64": 8,
     "bfloat16": 2,
+    "float8_e4m3": 1,
 }
 
 
@@ -42,6 +43,8 @@ _DTYPE_TO_ENUM = {
     "int64": 4,
     "bool": 5,
     "bfloat16": 6,
+    # keep in sync with AITemplateDtype (model_interface.h) -> kFloat8E4M3
+    "float8_e4m3": 7,
 }
 
 
@@ -133,6 +136,8 @@ def dtype_to_enumerator(dtype: str) -> str:
             return "kBool"
         elif dtype == "bfloat16":
             return "kBFloat16"
+        elif dtype == "float8_e4m3":
+            return "kFloat8E4M3"
         else:
             raise AssertionError(f"unknown dtype {dtype}")
 
