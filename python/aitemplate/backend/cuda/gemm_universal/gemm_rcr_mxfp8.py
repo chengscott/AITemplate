@@ -111,7 +111,7 @@ __global__ void {{func_name}}_quant(const __half* __restrict__ a,
         float av = f.x * rrms * gf.x, bv = f.y * rrms * gf.y; {{relu_stmt}}
         amax = fmaxf(amax, fmaxf(fabsf(av), fabsf(bv))); nh[i] = __float22half2_rn(make_float2(av, bv)); }
     }
-    int b = amax > 0.f ? ((int)ceilf(__log2f(amax * (1.0f / 448.0f))) + 127) : 0; b = b < 0 ? 0 : (b > 254 ? 254 : b);
+    int b = amax > 0.f ? ((int)ceilf(log2f(amax * (1.0f / 448.0f))) + 127) : 0; b = b < 0 ? 0 : (b > 254 ? 254 : b);
     float inv = amax > 0.f ? exp2f((float)(127 - b)) : 0.f;
     sfa[(row >> 7) * (long long)ntx * 512 + (kb >> 2) * 512 + (iy % 32) * 16 + (iy >> 5) * 4 + (kb & 3)] = (unsigned char)b;
 #pragma unroll
@@ -143,7 +143,7 @@ __global__ void {{func_name}}_quant(const __half* __restrict__ a,
     for (int j = 0; j < 4; j++) { const __half2* h = reinterpret_cast<const __half2*>(&xbuf[bi][j]);
 #pragma unroll
       for (int i = 0; i < 4; i++) { float2 f = __half22float2(h[i]); amax = fmaxf(amax, fmaxf(fabsf(f.x), fabsf(f.y))); } }
-    int b = amax > 0.f ? ((int)ceilf(__log2f(amax * (1.0f / 448.0f))) + 127) : 0; b = b < 0 ? 0 : (b > 254 ? 254 : b);
+    int b = amax > 0.f ? ((int)ceilf(log2f(amax * (1.0f / 448.0f))) + 127) : 0; b = b < 0 ? 0 : (b > 254 ? 254 : b);
     float inv = amax > 0.f ? exp2f((float)(127 - b)) : 0.f;
     sfa[(row >> 7) * (long long)ntx * 512 + (kb >> 2) * 512 + (iy % 32) * 16 + (iy >> 5) * 4 + (kb & 3)] = (unsigned char)b;
 #pragma unroll
@@ -174,7 +174,7 @@ __global__ void {{func_name}}_quant(const __half* __restrict__ a,
         float bv = (gy / (1.f + __expf(-gy))) * (uf.y * rf);
         amax = fmaxf(amax, fmaxf(fabsf(av), fabsf(bv))); zh[i] = __float22half2_rn(make_float2(av, bv)); }
     }
-    int b = amax > 0.f ? ((int)ceilf(__log2f(amax * (1.0f / 448.0f))) + 127) : 0; b = b < 0 ? 0 : (b > 254 ? 254 : b);
+    int b = amax > 0.f ? ((int)ceilf(log2f(amax * (1.0f / 448.0f))) + 127) : 0; b = b < 0 ? 0 : (b > 254 ? 254 : b);
     float inv = amax > 0.f ? exp2f((float)(127 - b)) : 0.f;
     sfa[(row >> 7) * (long long)ntx * 512 + (kb >> 2) * 512 + (iy % 32) * 16 + (iy >> 5) * 4 + (kb & 3)] = (unsigned char)b;
 #pragma unroll
@@ -191,7 +191,7 @@ __global__ void {{func_name}}_quant(const __half* __restrict__ a,
     for (int j = 0; j < 4; j++) { uint4 q = ar[kb * 4 + j]; buf[j] = q; const __half2* h = reinterpret_cast<const __half2*>(&q);
 #pragma unroll
       for (int i = 0; i < 4; i++) { float2 f = __half22float2(h[i]); amax = fmaxf(amax, fmaxf(fabsf(f.x), fabsf(f.y))); } }
-    int b = amax > 0.f ? ((int)ceilf(__log2f(amax * (1.0f / 448.0f))) + 127) : 0; b = b < 0 ? 0 : (b > 254 ? 254 : b);
+    int b = amax > 0.f ? ((int)ceilf(log2f(amax * (1.0f / 448.0f))) + 127) : 0; b = b < 0 ? 0 : (b > 254 ? 254 : b);
     float inv = amax > 0.f ? exp2f((float)(127 - b)) : 0.f;
     sfa[(row >> 7) * (long long)ntx * 512 + (kb >> 2) * 512 + (iy % 32) * 16 + (iy >> 5) * 4 + (kb & 3)] = (unsigned char)b;
 #pragma unroll
@@ -239,6 +239,9 @@ void {{func_name}}(const void* a_ptr, {% if norm == 'rmsnorm' %}const void* gamm
 {% endif %}{% if norm == 'rms_out' %}                                               reinterpret_cast<__half*>(rrms_out_ptr), {{eps}}f,
 {% endif %}                                               reinterpret_cast<unsigned char*>(s_aq), s_sfa,
                                                (long long)M, nkb, ntx);
+    cudaError_t qe = cudaGetLastError();
+    if (qe != cudaSuccess)
+      throw std::runtime_error(std::string("mxfp8 quant kernel launch: ") + cudaGetErrorString(qe));
   }
   const DataA* a_e4m3 = s_aq;
   const ScaleT* a_sf = reinterpret_cast<const ScaleT*>(s_sfa);
