@@ -213,9 +213,9 @@ __global__ void {{func_name}}_quant(const __half* __restrict__ a,
 #endif
 }  // namespace {{func_name}}_ns
 
-// A [M,{{K}}]{{ ' e4m3 + a_scale (swizzled SFA)' if prequant else ' f16 (quantized internally)' }},
+// A [M,{{K}}] f16 (quantized internally),
 // B [{{N}},{{K}}] e4m3 + b_scale (ue8m0 swizzled SFB, baked) -> D [M,{{N}}] f16.
-void {{func_name}}(const void* a_ptr, {% if prequant %}const void* ascale_ptr, {% endif %}{% if norm == 'rmsnorm' %}const void* gamma_ptr, {% endif %}{% if norm == 'swiglu' %}const void* rrms_ptr, {% endif %}const void* b_ptr, const void* bscale_ptr,
+void {{func_name}}(const void* a_ptr, {% if norm == 'rmsnorm' %}const void* gamma_ptr, {% endif %}{% if norm == 'swiglu' %}const void* rrms_ptr, {% endif %}const void* b_ptr, const void* bscale_ptr,
                    const void* residual_ptr, void* out_ptr, {% if norm == 'rms_out' %}void* rrms_out_ptr, {% endif %}int64_t M, cudaStream_t stream) {
   using namespace {{func_name}}_ns;
   const int N = {{N}}, K = {{K}}, nkb = K / 32, ntx = (nkb + 3) / 4; (void)nkb; (void)ntx;
@@ -225,10 +225,6 @@ void {{func_name}}(const void* a_ptr, {% if prequant %}const void* ascale_ptr, {
   StrideD stride_D = cutlass::make_cute_packed_stride(StrideD{}, {static_cast<int>(M), N, 1});
   auto layout_SFA = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFA(cute::make_shape(static_cast<int>(M), N, K, 1));
   auto layout_SFB = Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(cute::make_shape(static_cast<int>(M), N, K, 1));
-{% if prequant %}
-  const DataA* a_e4m3 = reinterpret_cast<const DataA*>(a_ptr);
-  const ScaleT* a_sf = reinterpret_cast<const ScaleT*>(ascale_ptr);
-{% else %}
   // static workspaces: quantized activation (e4m3) + its swizzled SFA (ue8m0)
   static DataA* s_aq = nullptr; static size_t s_aq_m = 0;
   static unsigned char* s_sfa = nullptr; static size_t s_sfa_sz = 0;
@@ -246,7 +242,6 @@ void {{func_name}}(const void* a_ptr, {% if prequant %}const void* ascale_ptr, {
   }
   const DataA* a_e4m3 = s_aq;
   const ScaleT* a_sf = reinterpret_cast<const ScaleT*>(s_sfa);
-{% endif %}
   cutlass::KernelHardwareInfo hw_info;
   typename Gemm::Arguments arguments{
       cutlass::gemm::GemmUniversalMode::kGemm, {static_cast<int>(M), N, K, 1},
@@ -268,7 +263,7 @@ void {{func_name}}(const void* a_ptr, {% if prequant %}const void* ascale_ptr, {
 )
 
 FUNC_DECL_TEMPLATE = jinja2.Template(
-    "\nvoid {{func_name}}(const void*, {% if prequant %}const void*, {% endif %}"
+    "\nvoid {{func_name}}(const void*, "
     "{% if norm == 'rmsnorm' %}const void*, {% endif %}{% if norm == 'swiglu' %}const void*, {% endif %}const void*, const void*, "
     "const void*, void*, {% if norm == 'rms_out' %}void*, {% endif %}int64_t, cudaStream_t);\n"
 )
@@ -276,7 +271,7 @@ FUNC_DECL_TEMPLATE = jinja2.Template(
 FUNC_CALL_TEMPLATE = jinja2.Template(
     """
 {{indent}}{{func_name}}(
-{{indent}}    {{a_ptr}}, {% if ascale_ptr %}{{ascale_ptr}}, {% endif %}{% if gamma_ptr %}{{gamma_ptr}}, {% endif %}{% if rrms_ptr %}{{rrms_ptr}}, {% endif %}{{b_ptr}}, {{bscale_ptr}}, {{residual_ptr}}, {{out_ptr}}, {% if rrms_out_ptr %}{{rrms_out_ptr}}, {% endif %}{{m_expr}}, stream
+{{indent}}    {{a_ptr}}, {% if gamma_ptr %}{{gamma_ptr}}, {% endif %}{% if rrms_ptr %}{{rrms_ptr}}, {% endif %}{{b_ptr}}, {{bscale_ptr}}, {{residual_ptr}}, {{out_ptr}}, {% if rrms_out_ptr %}{{rrms_out_ptr}}, {% endif %}{{m_expr}}, stream
 {{indent}});
 """
 )
@@ -299,7 +294,6 @@ def gen_function(func_attrs):
     return FUNC_TEMPLATE.render(
         func_name=func_attrs["name"], N=func_attrs["N"], K=K,
         has_residual=func_attrs.get("has_residual", False),
-        prequant=func_attrs.get("has_prequant", False),
         norm=func_attrs.get("norm", "none"), relu_stmt=relu_stmt,
         NCHUNK=(nkb + 31) // 32, eps=func_attrs.get("eps", 1e-6),
         tile=tile, cluster=cluster,
@@ -309,20 +303,17 @@ def gen_function(func_attrs):
 @registry.reg("cuda.gemm_rcr_mxfp8.func_decl")
 def gen_function_decl(func_attrs):
     return FUNC_DECL_TEMPLATE.render(
-        func_name=func_attrs["name"], prequant=func_attrs.get("has_prequant", False),
+        func_name=func_attrs["name"],
         norm=func_attrs.get("norm", "none"),
     )
 
 
 @registry.reg("cuda.gemm_rcr_mxfp8.func_call")
 def gen_function_call(func_attrs, indent="  "):
-    # inputs: [a, b, b_scale] + [a_scale?] + [gamma?] + [residual?]
+    # inputs: [a, b, b_scale] + [gamma? (rmsnorm)] + [rrms? (swiglu)] + [residual?]
     ins = func_attrs["inputs"]
     a, b, bscale = ins[0], ins[1], ins[2]
     idx = 3
-    ascale_ptr = None
-    if func_attrs.get("has_prequant", False):
-        ascale_ptr = ins[idx]._attrs["name"]; idx += 1
     gamma_ptr = None
     if func_attrs.get("norm", "none") == "rmsnorm":
         gamma_ptr = ins[idx]._attrs["name"]; idx += 1
@@ -337,7 +328,7 @@ def gen_function_call(func_attrs, indent="  "):
     m_expr = " * ".join(d._attrs["name"] for d in a._attrs["shape"][:-1]) or "1"
     return FUNC_CALL_TEMPLATE.render(
         indent=indent, func_name=func_attrs["name"],
-        a_ptr=a._attrs["name"], ascale_ptr=ascale_ptr, gamma_ptr=gamma_ptr, rrms_ptr=rrms_ptr,
+        a_ptr=a._attrs["name"], gamma_ptr=gamma_ptr, rrms_ptr=rrms_ptr,
         b_ptr=b._attrs["name"], bscale_ptr=bscale._attrs["name"],
         residual_ptr=residual_ptr, out_ptr=out._attrs["name"], rrms_out_ptr=rrms_out_ptr, m_expr=m_expr,
     )
