@@ -256,6 +256,25 @@ _IDENTITY = "cutlass::epilogue::thread::Identity"
 _RELU = "cutlass::epilogue::thread::ReLu"
 
 
+def _residual_evt_arches():
+    """Arches on which gemm_rcr_bias_add / _relu route through the LinCombPerColBias EVT.
+
+    SM100 (Blackwell) always: without it these residual gemms fall back to the SM80 2.x
+    kernels, and the tcgen05 EVT is up to ~2x faster on memory-bound, small-N gemms.
+
+    SM90 (Hopper) is OPT-IN via AIT_SM90_RESIDUAL_EVT=1 (default off). It builds + parity-
+    checks correctly and its SM90 3.x EVT candidates are profiled, but on memory-bound
+    small-N gemms the SM90 TMA warp-specialized kernels are not faster than SM80 (unlike
+    Blackwell tcgen05), so the profiler keeps SM80 -- off by default (no build cost),
+    available for a compute-bound regime where the SM90 3.x kernels could win.
+    """
+    import os
+
+    if os.environ.get("AIT_SM90_RESIDUAL_EVT") == "1":
+        return ("90", "100")
+    return ("100",)
+
+
 def _sm100_evt_kind(unary_op1, binary_op1, binary_op2, unary_op2):
     """Classify a broadcast config into an SM100-EVT-supported kind, else _UNSUPPORTED_SM100.
 
@@ -464,6 +483,14 @@ SRC_TEMPLATE = jinja2.Template(
 #include "cutlass/gemm/device/gemm_universal_adapter.h"
 #include "cutlass/epilogue/collective/epilogue_tensor_broadcast.hpp"
 #include "cutlass/epilogue/thread/linear_combination_tensor_broadcast.hpp"
+// SM100 residual EVT (gemm_rcr_bias_add / _relu -> LinCombPerColBias[EltAct]) is built via
+// the 3.x EPILOGUE collective builder + fusion operations. The broadcast profiler/function
+// header set was written for the 2.x/SM90 TensorBroadcast path and omitted these, so the
+// emitted `cutlass::epilogue::collective::CollectiveBuilder<...>` errored with
+// "namespace has no member CollectiveBuilder". (The plain gemm_rcr_bias path already
+// includes the epilogue collective builder.)
+#include "cutlass/epilogue/collective/collective_builder.hpp"
+#include "cutlass/epilogue/fusion/operations.hpp"
 
 using bfloat16 = nv_bfloat16;
 
@@ -832,11 +859,11 @@ def gemm_bias_broadcast_config(
         layout=layout,
         include_cutlass_3x_ops=True,
     )
-    if Target.current()._arch != "100":
+    if Target.current()._arch not in _residual_evt_arches():
         return
-    # SM100 (Blackwell): the CUTLASS 3.x TensorBroadcast epilogue uses an Sm90 adapter that
-    # doesn't apply here. Route the single-residual add / add_relu configs through the EVT
-    # LinCombPerColBias[EltAct] functor; drop every other config's 3.x ops to the SM80 fallback.
+    # Route the single-residual add / add_relu configs through the EVT LinCombPerColBias[EltAct]
+    # functor (non-transposed); drop every other config's 3.x ops to the SM80 fallback.
+    # Always on for SM100; opt-in for SM90 (AIT_SM90_RESIDUAL_EVT) -- see _residual_evt_arches.
     from aitemplate.backend.cuda.gemm_universal import (
         common_bias_activation,
         gemm_rcr_bias,
@@ -853,6 +880,34 @@ def gemm_bias_broadcast_config(
         if kind is _UNSUPPORTED_SM100:
             drop.append(name)  # add_add / mul_add (2nd aux tensor) -> SM80 fallback
             continue
+        # The residual candidates that survive default_fproc carry StreamK schedulers, dynamic
+        # clusters, and explicit TmaWarpSpecialized* schedules -- not all of which build the
+        # residual EVT collective. Normalize each to the buildable, profileable form (arch-aware).
+        _arch = Target.current()._arch
+        _td = getattr(op, "tile_description", None)
+        _cluster = list(getattr(_td, "cluster_shape", []) or [])
+        if (not _cluster) or _cluster[0] == 0 or _cluster[1] == 0:
+            drop.append(name)  # dynamic cluster [0,0,1]: not buildable with the residual EVT
+            continue
+        if _arch == "100" and _cluster != [1, 1, 1]:
+            # SM100: only the single-CTA [1,1,1] cluster builds the residual EVT collective;
+            # multi-CTA / oversized clusters fail. Any [1,1,1] tile (64x128/128x128/128x256) is
+            # kept so the profiler tunes per shape; all are ~2x SM80 on these memory-bound gemms.
+            drop.append(name)
+            continue
+        # SM90 (opt-in) keeps its standard static clusters ([2,1,1]/[1,2,1]) -- the Sm90 EVT
+        # builds with those; an SM100-style [1,1,1]-only filter would drop them all.
+        if getattr(op, "tile_scheduler", None) == lib.TileSchedulerType.StreamK:
+            op.tile_scheduler = lib.TileSchedulerType.Default
+        if _arch == "100":
+            # SM100: Auto -> a TMA warp-specialized kernel+epilogue that supports the fusion.
+            op.kernel_schedule = lib.KernelScheduleType.ScheduleAuto
+            op.epilogue_schedule = lib.EpilogueScheduleType.ScheduleAuto
+        else:
+            # SM90: Auto -> NoSmemWarpSpecialized ("Auto schedule doesn't support fusion");
+            # fusion needs an explicit TmaWarpSpecialized epilogue. Keep the op's own
+            # warp-specialized mainloop schedule (pingpong/cooperative) from the generator.
+            op.epilogue_schedule = lib.EpilogueScheduleType.TmaWarpSpecialized
         kwargs = dict(
             element_output=lib.DataTypeTag[op.D.element],
             element_compute=lib.DataTypeTag[op.element_epilogue],
@@ -904,7 +959,7 @@ def gen_profiler(
     has_d1 = common.has_d1(func_attrs)
     _kind = (
         _sm100_evt_kind(unary_op1, binary_op1, binary_op2, unary_op2)
-        if Target.current()._arch == "100"
+        if Target.current()._arch in _residual_evt_arches()
         else _UNSUPPORTED_SM100
     )
     sm100_evt = _kind is not _UNSUPPORTED_SM100
@@ -1085,7 +1140,7 @@ def gen_function(
     has_d1 = common.has_d1(func_attrs)
     _kind = (
         _sm100_evt_kind(unary_op1, binary_op1, binary_op2, unary_op2)
-        if Target.current()._arch == "100"
+        if Target.current()._arch in _residual_evt_arches()
         else _UNSUPPORTED_SM100
     )
     sm100_evt = _kind is not _UNSUPPORTED_SM100

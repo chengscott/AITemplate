@@ -859,6 +859,28 @@ def extract_config_name(
     return match.groups()[0]
 
 
+def fill_empty_exec_path(func_attrs):
+    """Per-node safety net for AIT_GEMM_M_BUCKETS.
+
+    A bucket whose profiler found no instance at its M -- or, for a duplicate node
+    that read algos from the profile cache, a bucket that missed the cache -- leaves
+    exec_path[key].algo == "", which makes op_instance[""] raise at codegen. The
+    postprocess_results fill only covers directly-profiled nodes (seen_func_attrs),
+    so cache-fed duplicate nodes slip through. Any profiled kernel for this op is
+    correct at any M in the dynamic range (larger tiles just mask small M), so fill
+    empty buckets from a non-empty sibling. No-op in the single-bucket MAX/MIN default.
+    """
+    exec_path = func_attrs.get("exec_path", {})
+    valid = next(
+        (it.algo for it in exec_path.values() if getattr(it, "algo", "")), None
+    )
+    if valid is None:
+        return
+    for item in exec_path.values():
+        if not getattr(item, "algo", ""):
+            item.algo = valid
+
+
 def gen_function(
     func_attrs,
     src_template,
@@ -884,6 +906,7 @@ def gen_function(
         func_attrs["outputs"][0]._attrs["dtype"]
     )
     func_name = func_attrs["name"]
+    fill_empty_exec_path(func_attrs)
     exec_path = func_attrs["exec_path"]
     op_instance = func_attrs["op_instance"]
     inst_def_flag = set()
@@ -1444,6 +1467,23 @@ def default_fproc(
                     op.epilogue_functor = (
                         cutlass_lib.library.EpilogueFunctor3x.LinearCombination
                     )
+            elif (
+                Target.current()._arch == "100"
+                and op.epilogue_functor
+                == cutlass_lib.library.EpilogueFunctor.LinearCombinationResidualBlock
+                and op.epilogue_schedule
+                in (
+                    cutlass_lib.library.EpilogueScheduleType.TmaWarpSpecialized1Sm,
+                    cutlass_lib.library.EpilogueScheduleType.TmaWarpSpecialized2Sm,
+                )
+            ):
+                # SM100 residual gemm (gemm_rcr_bias_add / _relu): keep the SM100 TMA op.
+                # The SM100 TMA epilogue schedules aren't in the SM90 whitelist above, so
+                # without this branch the op is dropped and the residual gemms fall back to
+                # the SM80 2.x kernels. The placeholder LinearCombination conversion below +
+                # common_bias_broadcast's arch-100 EVT supply the real residual fusion
+                # downstream.
+                pass
             else:
                 # epilogue functor parameterization unavailable
                 # for the rest of epilogue schedule types

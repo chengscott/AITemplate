@@ -369,12 +369,16 @@ def gen_function(
         elem_input_type=elem_input_type,
         elem_output_type=elem_output_type,
     )
+    # AIT_GEMM_M_BUCKETS may leave a bucket's algo empty on cache-fed duplicate nodes
+    # (see common.fill_empty_exec_path); fill before indexing op_instance[algo] here.
+    common.fill_empty_exec_path(func_attrs)
     problem_args_cutlass_3x = PROBLEM_ARGS_TEMPLATE_CUTLASS_3X.render(
         elem_input_type=elem_input_type,
         elem_output_type=elem_output_type,
         has_tma_epilogue=any(
             common.has_tma_epilogue(func_attrs["op_instance"][exec_item.algo])
             for exec_item in func_attrs["exec_path"].values()
+            if exec_item.algo
         ),
         evt=bias_use_evt(),
     )
