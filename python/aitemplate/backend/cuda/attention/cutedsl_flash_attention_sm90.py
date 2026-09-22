@@ -27,8 +27,7 @@ and bakes everything else (softmax scale, causal flag, all optional tensors,
 
     cute_dsl_<name>_wrapper(module, mQ, mK, mV, mO, mLSE, stream)
 
-To make the embedded kernel *bit-identical* to the pip ``flash_attn_func`` (the
-correctness check compares against it), the SM90 tile / stage / warp config is
+For the general case, the SM90 tile / stage / warp config is
 taken from FlashAttention-4's own dispatcher rather than hand-picked: tile sizes
 and the ``mma_pv_is_rs`` / ``intra_wg_overlap`` flags come from
 ``flash_attn.cute.interface._tile_size_fwd_sm90`` and the remaining knobs
@@ -64,7 +63,8 @@ class FlashAttentionFwdSm90Aot:
 
     The tile config (tile_m/tile_n + ``mma_pv_is_rs``/``intra_wg_overlap``) is
     derived from FA4's ``_tile_size_fwd_sm90`` for the given (head_dim, causal),
-    so the kernel matches what ``flash_attn_func`` launches on Hopper.
+    except for short, noncausal sequences with head_dim=16, which use a
+    128x64 cp.async/mma.sync kernel; FP16 rounding may differ slightly.
     """
 
     def __init__(
@@ -73,9 +73,36 @@ class FlashAttentionFwdSm90Aot:
         softmax_scale: float,
         is_causal: bool,
         dtype=cutlass.Float16,
-        seq_len: int = None,  # unused on SM90 (tile/stage config is seqlen-agnostic)
+        seq_len: int = None,
     ):
         self.softmax_scale = softmax_scale
+        if (
+            dtype == cutlass.Float16
+            and head_dim == 16
+            and not is_causal
+            and seq_len is not None
+            and 0 < seq_len <= 128
+        ):
+            # Short, narrow-head attention is faster with cp.async + mma.sync
+            # than Hopper's producer/MMA warpgroups. The 64-key tile has small
+            # FP16 rounding differences versus the native 128-key reduction.
+            from cutlass.base_dsl.arch import Arch
+
+            from .cutedsl_flash_attention_sm80 import FlashAttentionFwdSm80Aot
+
+            self.fa = FlashAttentionFwdSm80Aot(
+                head_dim=head_dim,
+                softmax_scale=softmax_scale,
+                is_causal=is_causal,
+                dtype=dtype,
+                tile_m=128,
+                tile_n=64,
+                num_threads=128,
+            ).fa
+            # FA4 otherwise detects SM90 and enables TMA-O without the TMA
+            # descriptor required by its Ampere entry point.
+            self.fa.arch = Arch.sm_80
+            return
         # Dense (no local/window) forward; head_dim_v == head_dim.
         fwd_cfg = _tile_size_fwd_sm90(
             head_dim, head_dim, is_causal, False  # is_local=False

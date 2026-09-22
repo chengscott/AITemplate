@@ -66,3 +66,5 @@ from aitemplate.backend.cuda.gemm_universal import (
     perm102_bmm_rrr,
     perm102_bmm_rrr_bias,
 )
+
+from aitemplate.backend.cuda.gemm_universal import rms_consumers

@@ -7,6 +7,7 @@
 import jinja2
 
 from aitemplate.backend import registry
+from aitemplate.backend.target import Target
 
 FUNC_TEMPLATE = jinja2.Template(
     """
@@ -20,7 +21,9 @@ __global__ void {{func_name}}_kernel(const __half* __restrict__ x,
 {% if fp8_out %}                                     __nv_fp8_e4m3* __restrict__ xq,
                                      float* __restrict__ scale,
 {% else %}                                     __half* __restrict__ z,
-{% endif %}                                     long long rows, int C, float eps) {
+{% endif %}                                     long long rows, int {% if specialize %}C_runtime{% else %}C{% endif %}, float eps) {
+{% if specialize %}  constexpr int C = {{channels}};
+{% endif %}
   const int warps_per_cta = blockDim.x >> 5;
   const long long row = (long long)blockIdx.x * warps_per_cta + (threadIdx.x >> 5);
   if (row >= rows) return;
@@ -30,7 +33,8 @@ __global__ void {{func_name}}_kernel(const __half* __restrict__ x,
   const uint4* gr = reinterpret_cast<const uint4*>(gamma);
 
   float ss = 0.f;
-  for (int v = lane; v < VECS; v += 32) {
+{% if specialize %}#pragma unroll
+{% endif %}  for (int v = lane; v < VECS; v += 32) {
     uint4 q = xr[v];
     const __half2* h = reinterpret_cast<const __half2*>(&q);
 #pragma unroll
@@ -92,7 +96,8 @@ __global__ void {{func_name}}_kernel(const __half* __restrict__ x,
   }
 {% else %}
   uint4* zr = reinterpret_cast<uint4*>(z + row * (long long)C);
-  for (int v = lane; v < VECS; v += 32) {
+{% if specialize %}#pragma unroll
+{% endif %}  for (int v = lane; v < VECS; v += 32) {
     uint4 q = xr[v];
     uint4 g = gr[v];
     __half2* h = reinterpret_cast<__half2*>(&q);
@@ -116,7 +121,7 @@ void {{func_name}}(const void* x_ptr, const void* gamma_ptr,
 {% if fp8_out %}                   void* xq_ptr, void* scale_ptr,
 {% else %}                   void* z_ptr,
 {% endif %}                   int64_t rows, int64_t C, float eps, cudaStream_t stream) {
-  constexpr int BLK = 128;  // 4 warps/CTA, one row per warp
+  constexpr int BLK = {{256 if specialize else 128}};  // one row per warp
   const unsigned int grid = (unsigned int)((rows + (BLK >> 5) - 1) / (BLK >> 5));
   {{func_name}}_kernel<<<grid, BLK, 0, stream>>>(
       reinterpret_cast<const __half*>(x_ptr),
@@ -157,6 +162,10 @@ def rmsnorm_gen_function(func_attrs):
         relu_stmt=relu_stmt,
         fp8_out=func_attrs.get("fp8_out", False),
         NCHUNK=((C >> 3) + 31) // 32,
+        # Static widths remove integer division and unroll the vector loads.
+        specialize=(Target.current()._arch in ("90", "100") or
+                    (Target.current()._arch == "80" and not func_attrs.get("fp8_out", False))),
+        channels=C,
     )
 
 

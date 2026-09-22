@@ -137,3 +137,5 @@ from aitemplate.compiler.ops.gemm_universal.perm102_bmm_rrr import perm102_bmm_r
 from aitemplate.compiler.ops.gemm_universal.perm102_bmm_rrr_bias import (
     perm102_bmm_rrr_bias,
 )
+
+from aitemplate.compiler.ops.gemm_universal.rms_consumers import rms_swiglu, rms_unpack_rope

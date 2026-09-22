@@ -5,6 +5,7 @@
 import jinja2
 
 from aitemplate.backend import registry
+from aitemplate.backend.target import Target
 
 FUNC_TEMPLATE = jinja2.Template(
     """
@@ -16,7 +17,9 @@ namespace {
 // One WARP per row: NCHUNK uint4 held in registers, fp32 warp-reduce of sum(x^2) and absmax.
 __global__ void {{func_name}}_kernel(const __half* __restrict__ x, __nv_fp8_e4m3* __restrict__ xq,
                                      float* __restrict__ scale, __half* __restrict__ rrms,
-                                     long long rows, int C, float eps) {
+                                     long long rows, int {% if specialize %}C_runtime{% else %}C{% endif %}, float eps) {
+{% if specialize %}  constexpr int C = {{C}};
+{% endif %}
   const int warps_per_cta = blockDim.x >> 5;
   const long long row = (long long)blockIdx.x * warps_per_cta + (threadIdx.x >> 5);
   if (row >= rows) return;
@@ -72,7 +75,7 @@ __global__ void {{func_name}}_kernel(const __half* __restrict__ x, __nv_fp8_e4m3
 // x [rows,C] f16 -> xq [rows,C] e4m3 + scale [rows] f32 + rrms [rows] f16. C % 8 == 0.
 void {{func_name}}(const void* x_ptr, void* xq_ptr, void* scale_ptr, void* rrms_ptr,
                    int64_t rows, int64_t C, float eps, cudaStream_t stream) {
-  constexpr int BLK = 128;  // 4 warps/CTA, one row per warp
+  constexpr int BLK = {{256 if specialize else 128}};  // one row per warp
   const unsigned int grid = (unsigned int)((rows + (BLK >> 5) - 1) / (BLK >> 5));
   {{func_name}}_kernel<<<grid, BLK, 0, stream>>>(
       reinterpret_cast<const __half*>(x_ptr), reinterpret_cast<__nv_fp8_e4m3*>(xq_ptr),
@@ -102,7 +105,8 @@ def _C(func_attrs):
 @registry.reg("cuda.rms_quantize.gen_function")
 def gen_function(func_attrs):
     C = _C(func_attrs)
-    return FUNC_TEMPLATE.render(func_name=func_attrs["name"], NCHUNK=((C >> 3) + 31) // 32)
+    return FUNC_TEMPLATE.render(func_name=func_attrs["name"], NCHUNK=((C >> 3) + 31) // 32,
+                                C=C, specialize=Target.current()._arch in ("90", "100"))
 
 
 @registry.reg("cuda.rms_quantize.func_decl")

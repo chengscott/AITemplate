@@ -5,6 +5,7 @@
 import jinja2
 
 from aitemplate.backend import registry
+from aitemplate.backend.target import Target
 
 FUNC_TEMPLATE = jinja2.Template(
     """
@@ -14,7 +15,9 @@ FUNC_TEMPLATE = jinja2.Template(
 namespace {
 // One WARP per row: 128-bit (uint4=8 half) loads, fp32 sum(x^2), warp-shuffle reduction.
 __global__ void {{func_name}}_kernel(const __half* __restrict__ x, __half* __restrict__ rrms,
-                                     long long rows, int C, float eps) {
+                                     long long rows, int {% if specialize %}C_runtime{% else %}C{% endif %}, float eps) {
+{% if specialize %}  constexpr int C = {{channels}};
+{% endif %}
   const int warps_per_cta = blockDim.x >> 5;
   const long long row = (long long)blockIdx.x * warps_per_cta + (threadIdx.x >> 5);
   if (row >= rows) return;
@@ -22,7 +25,8 @@ __global__ void {{func_name}}_kernel(const __half* __restrict__ x, __half* __res
   const int VECS = C >> 3;
   const uint4* xr = reinterpret_cast<const uint4*>(x + row * (long long)C);
   float ss = 0.f;
-  for (int v = lane; v < VECS; v += 32) {
+{% if specialize %}#pragma unroll
+{% endif %}  for (int v = lane; v < VECS; v += 32) {
     uint4 q = xr[v];
     const __half2* h = reinterpret_cast<const __half2*>(&q);
 #pragma unroll
@@ -40,7 +44,7 @@ __global__ void {{func_name}}_kernel(const __half* __restrict__ x, __half* __res
 // rrms[rows] = rsqrt(mean(x^2)+eps) over the last dim C (C % 8 == 0). No workspace.
 void {{func_name}}(const void* x_ptr, void* rrms_ptr, int64_t rows, int64_t C, float eps,
                    cudaStream_t stream) {
-  constexpr int BLK = 128;  // 4 warps/CTA, one row per warp
+  constexpr int BLK = {{256 if specialize else 128}};  // one row per warp
   const unsigned int grid = (unsigned int)((rows + (BLK >> 5) - 1) / (BLK >> 5));
   {{func_name}}_kernel<<<grid, BLK, 0, stream>>>(
       reinterpret_cast<const __half*>(x_ptr), reinterpret_cast<__half*>(rrms_ptr),
@@ -64,7 +68,11 @@ FUNC_CALL_TEMPLATE = jinja2.Template(
 
 @registry.reg("cuda.rms_reduce.gen_function")
 def rms_reduce_gen_function(func_attrs):
-    return FUNC_TEMPLATE.render(func_name=func_attrs["name"])
+    return FUNC_TEMPLATE.render(
+        func_name=func_attrs["name"],
+        specialize=Target.current()._arch in ("80", "90", "100"),
+        channels=func_attrs["inputs"][0]._attrs["shape"][-1]._attrs["values"][0],
+    )
 
 
 @registry.reg("cuda.rms_reduce.func_decl")

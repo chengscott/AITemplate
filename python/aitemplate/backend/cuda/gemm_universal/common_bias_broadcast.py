@@ -927,6 +927,36 @@ def gemm_bias_broadcast_config(
     for name in drop:
         del func_attrs["op_instance"][name]
 
+    # Keep channel-aligned residual candidates alongside the original tiles.
+    n_values = func_attrs["inputs"][1]._attrs["shape"][0]._attrs["values"]
+    if (
+        Target.current()._arch == "100"
+        and kind is not _UNSUPPORTED_SM100
+        and kind[0] == "add"
+        and len(n_values) == 1
+        and n_values[0] % 192 == 0
+    ):
+        import copy
+
+        for op in list(func_attrs["op_instance"].values()):
+            td = op.tile_description
+            if (
+                op.gemm_kind == lib.GemmKind.Universal3x
+                and op.A.element == lib.DataType.f16
+                and op.accumulator_type() == lib.DataType.f32
+                and list(td.cluster_shape) == [1, 1, 1]
+                and list(td.tile_shape) == [128, 256, 64]
+            ):
+                aligned = copy.deepcopy(op)
+                atd = aligned.tile_description
+                atd.threadblock_shape = [128, 192, 64]
+                atd.tile_shape = atd.threadblock_shape
+                inst = list(atd.math_instruction.instruction_shape)
+                inst[1] = 192
+                atd.math_instruction.instruction_shape = inst
+                aligned.__dict__.pop("_procedural_name", None)
+                func_attrs["op_instance"][common.kernel_name(aligned)] = aligned
+
 
 def gen_profiler(
     func_attrs,

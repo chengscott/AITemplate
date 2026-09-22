@@ -989,6 +989,41 @@ def extract_config(
             op._ait_fusion_cpp = fusion_cpp
             op._ait_is_residual = is_residual
             ret.append(op)
+            # Add channel-aligned alternatives for 192-channel SM90/SM100
+            # convolution trunks. Profile alongside the original tiles so
+            # each shape retains its fastest option.
+            td = op.tile_description
+            co = func_attrs["inputs"][1]._attrs["shape"][0]._attrs["values"]
+            if (
+                Target.current()._arch in ("90", "100")
+                and data_type == cutlass_lib.library.DataType.f16
+                and acc_type == cutlass_lib.library.DataType.f32
+                and list(td.cluster_shape) == [1, 1, 1]
+                and list(td.tile_shape) in ([64, 128, 64], [128, 128, 64])
+                and len(co) == 1
+                and co[0] % 192 == 0
+            ):
+                for tile_n in (64, 192):
+                    aligned = copy.deepcopy(op)
+                    atd = aligned.tile_description
+                    atd.threadblock_shape = [td.tile_shape[0], tile_n, 64]
+                    atd.tile_shape = atd.threadblock_shape
+                    atd.math_instruction.instruction_shape = [td.tile_shape[0], tile_n, 16]
+                    ret.append(aligned)
+                    if (
+                        Target.current()._arch == "100"
+                        and td.tile_shape[0] == 128
+                        and tile_n == 192
+                    ):
+                        # Conv3x stores the per-CTA M extent here. Its emitter
+                        # doubles M for a 2-SM instruction: 128 -> MMA M=256.
+                        # Doubling this descriptor too would emit invalid M=512.
+                        paired = copy.deepcopy(aligned)
+                        paired.tile_description.cluster_shape = [2, 1, 1]
+                        paired.kernel_schedule = (
+                            cutlass_lib.library.KernelScheduleType.ImplicitTmaWarpSpecialized2SmSm100
+                        )
+                        ret.append(paired)
             return ret
 
         if (

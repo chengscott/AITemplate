@@ -18,6 +18,7 @@ C = GeMM(A, B) + bias
 where A[RowMajor][M, K], B[ColMajor][N, K], bias[RowMajor][N]
 """
 
+import copy
 import os
 
 import jinja2
@@ -320,6 +321,36 @@ def gemm_rcr_config(func_attrs, dtype="float16"):
             op.C.layout = lib.LayoutType.ColumnMajor
             op.D.layout = lib.LayoutType.ColumnMajor
             op.epilogue_schedule = bias_map[op.epilogue_schedule]
+
+    # N=192 tiles avoid padding in 192/576/1152-channel projections on SM100.
+    # Retain the original choices: the extra tile is a profiling candidate,
+    # not a forced replacement for small M or other architectures/precisions.
+    n_values = func_attrs["inputs"][1]._attrs["shape"][0]._attrs["values"]
+    if (
+        Target.current()._arch == "100"
+        and len(n_values) == 1
+        and n_values[0] % 192 == 0
+    ):
+        for op in list(func_attrs["op_instance"].values()):
+            td = op.tile_description
+            if (
+                common.has_tma_epilogue(op)
+                and op.A.element == lib.DataType.f16
+                and op.accumulator_type() == lib.DataType.f32
+                and list(td.cluster_shape) == [1, 1, 1]
+                and list(td.tile_shape) == [128, 256, 64]
+            ):
+                aligned = copy.deepcopy(op)
+                atd = aligned.tile_description
+                atd.threadblock_shape = [128, 192, 64]
+                atd.tile_shape = atd.threadblock_shape
+                inst = list(atd.math_instruction.instruction_shape)
+                inst[1] = 192
+                atd.math_instruction.instruction_shape = inst
+                # CUTLASS caches the name during manifest generation. A copied
+                # operation must not retain the original tile's C++ type name.
+                aligned.__dict__.pop("_procedural_name", None)
+                func_attrs["op_instance"][common.kernel_name(aligned)] = aligned
 
 
 @registry.reg("cuda.gemm_rcr_bias.gen_profiler")

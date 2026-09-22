@@ -1,8 +1,6 @@
-#  Backend codegen for the FUSED fp8 gemm (gemm_rcr_fp8_fused): CUTLASS 3x SM90 fp8 gemm
-#  (RowMajor A, ColumnMajor B) whose epilogue folds dequant + per-N bias + residual:
-#     D_f16 = alpha * (A@B^T) + beta*residual + bias[n],  alpha = scale_x*scale_w
-#  via LinCombPerColBiasEltAct. Writes f16 directly (no f32 acc round-trip / dequant kernel).
-#  N,K baked; M runtime.
+# CUTLASS SM90/SM100 FP8 GEMM with FP32 accumulation and fused dequantization:
+# D_f16 = (scale_x[m] * scale_w[0]) * (A @ B.T) + beta * residual.
+# N/K are static; M is dynamic. Scales are consumed directly by the epilogue.
 import jinja2
 
 from aitemplate.backend import registry
@@ -17,6 +15,7 @@ FUNC_TEMPLATE = jinja2.Template(
 #include "cutlass/util/packed_stride.hpp"
 #include "cutlass/epilogue/thread/activation.h"
 #include "cutlass/epilogue/fusion/operations.hpp"
+#include "cutlass/epilogue/fusion/sm90_callbacks_tma_warpspecialized.hpp"
 #include "cutlass/gemm/gemm.h"
 #include "cutlass/gemm/dispatch_policy.hpp"
 #include "cutlass/gemm/collective/collective_builder.hpp"
@@ -36,21 +35,23 @@ using ElementCompute = float;
 using LayoutA = cutlass::layout::RowMajor;
 using LayoutB = cutlass::layout::ColumnMajor;
 using LayoutC = cutlass::layout::RowMajor;
-// SM90: tile chosen by N (swept on H200): N%256==0 -> 128x256 (fc1/up), N==384 -> 256x128
-// (qkv), N<=128 -> 128x128 (o/fc2/down). SM100 (Blackwell tcgen05, 1SM): MMA tile M must be
-// 128, N=128, K=64; cluster all-ones (1SM). Cluster 1x1x1 in both.
+// Architecture- and shape-specific tiles are selected by the code generator.
 using TileShapeMNK    = {{tile}};
 using ClusterShapeMNK = {{cluster}};
 constexpr int AlignA = 128 / cutlass::sizeof_bits<ElementA>::value;   // 16
 constexpr int AlignB = 128 / cutlass::sizeof_bits<ElementB>::value;   // 16
 constexpr int AlignC = 128 / cutlass::sizeof_bits<ElementOut>::value; // 8
 
-// Per-ROW (per-token) scale: D = alpha[m]*acc + beta*C (+ per-row bias, unused=0).
-// Works verbatim on SM100: its Sm100TmaWarpSpecialized FusionCallbacks inherit the Sm90
-// specialization for this op (cutlass sm100_callbacks_tma_warpspecialized.hpp).
-using FusionOp = cutlass::epilogue::fusion::PerRowLinCombPerRowBiasEltAct<
-    cutlass::epilogue::thread::Identity, ElementOut, ElementCompute, ElementOut,
-    ElementOut, float>;
+// Per-token and per-weight scales are multiplied in FP32 before scaling the accumulator.
+// These EVT visitors are supported by both SM90 and SM100 TMA epilogues.
+using namespace cutlass::epilogue::fusion;
+using ScaleProduct = Sm90EVT<Sm90Compute<cutlass::multiplies, float, float, cutlass::FloatRoundStyle::round_to_nearest>,
+    Sm90ColBroadcast<0, TileShapeMNK, float, float, Stride<_1,_0,int64_t>, 4>,
+    Sm90ScalarBroadcast<float, Stride<_0,_0,int64_t>>>;
+using ScaledAcc = Sm90EVT<Sm90Compute<cutlass::multiplies, float, float, cutlass::FloatRoundStyle::round_to_nearest>,
+    ScaleProduct, Sm90AccFetch>;
+using FusionOp = Sm90EVT<Sm90Compute<cutlass::homogeneous_multiply_add, ElementOut, float, cutlass::FloatRoundStyle::round_to_nearest>,
+    Sm90ScalarBroadcast<float, Stride<_0,_0,int64_t>>, Sm90SrcFetch<ElementOut>, ScaledAcc>;
 
 using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
     cutlass::arch::{{arch_tag}}, cutlass::arch::OpClassTensorOp, TileShapeMNK, ClusterShapeMNK,
@@ -86,13 +87,6 @@ using StrideD = typename Gemm::GemmKernel::StrideD;
   }
 #endif
 
-// per-row alpha[m] = scale_x[m] * scale_w[0]  (scale_x is the per-token quantize scale)
-__global__ void alpha_kernel(const float* sx, const float* sw, float* o, long long M) {
-  const float w = sw[0];
-  for (long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x; i < M;
-       i += (long long)gridDim.x * blockDim.x)
-    o[i] = sx[i] * w;
-}
 }  // namespace {{func_name}}_ns
 
 // A [M,{{K}}] e4m3, B [{{N}},{{K}}] e4m3 -> D [M,{{N}}] f16 (fused per-row scale + residual)
@@ -103,20 +97,9 @@ void {{func_name}}(const void* a_ptr, const void* b_ptr, const void* scale_x_ptr
   const int N = {{N}}, K = {{K}};
   // thread_local: one workspace set per host thread so concurrent inference threads (each on its
   // own stream) don't clobber a shared buffer (review finding #2). Costs the workspace x #threads.
-  thread_local static float* s_alpha = nullptr;
-  thread_local static size_t s_alpha_m = 0;
-  if ((size_t)M > s_alpha_m) {
-    if (s_alpha) cudaFree(s_alpha);
-    cudaMalloc(&s_alpha, sizeof(float) * (size_t)M);
-    s_alpha_m = (size_t)M;
-  }
-  {
-    unsigned int g = (unsigned int)((M + 255) / 256);
-    if (g > 4096u) g = 4096u;
-    alpha_kernel<<<g, 256, 0, stream>>>(
-        reinterpret_cast<const float*>(scale_x_ptr),
-        reinterpret_cast<const float*>(scale_w_ptr), s_alpha, (long long)M);
-  }
+  // Workspaces must retain their addresses across cached graph shapes.
+  thread_local static bool workspace_initialized = false;
+  const bool allocate_workspace = !workspace_initialized;
 
   StrideA stride_A = cutlass::make_cute_packed_stride(StrideA{}, {static_cast<int>(M), K, 1});
   StrideB stride_B = cutlass::make_cute_packed_stride(StrideB{}, {N, K, 1});
@@ -139,18 +122,21 @@ void {{func_name}}(const void* a_ptr, const void* b_ptr, const void* scale_x_ptr
        reinterpret_cast<ElementOut*>(out_ptr), stride_D{{'}'}},
       hw_info};
   auto& fa = arguments.epilogue.thread;
-  fa.alpha_ptr = s_alpha;   // per-row [M] (default dAlpha => per-row broadcast)
-  fa.beta = {{ '1.0f' if has_residual else '0.0f' }};
-  fa.bias_ptr = nullptr;    // linears are bias-free (=> bias contribution 0)
+  // Compute sx[m] * sw[0] in FP32 inside the epilogue, removing the
+  // scale-materialization kernel and its global-memory intermediate.
+  fa = {% raw %}{
+    {{ {% endraw %}{{ '1.0f' if has_residual else '0.0f' }}{% raw %} }, {nullptr}, {}}, {},
+    {{{reinterpret_cast<const float*>(scale_x_ptr), 0.f, {}},
+      {{0.f}, {reinterpret_cast<const float*>(scale_w_ptr)}, {}}, {}}, {}, {}}, {}};{% endraw %}
 
   Gemm gemm_op;
   thread_local static uint8_t* s_ws = nullptr;
-  thread_local static size_t s_ws_sz = 0;
-  size_t need = Gemm::get_workspace_size(arguments);
-  if (need > s_ws_sz) {
-    if (s_ws) cudaFree(s_ws);
-    cudaMalloc(&s_ws, need);
-    s_ws_sz = need;
+  if (allocate_workspace) {
+    auto size_args = arguments;
+    size_args.problem_shape = { {{max_m}}, N, K, 1 };
+    size_t need = Gemm::get_workspace_size(size_args);
+    if (need > 0) cudaMalloc(&s_ws, need);
+    workspace_initialized = true;
   }
   AIT_CUTLASS_CHECK(gemm_op.can_implement(arguments));
   AIT_CUTLASS_CHECK(gemm_op.initialize(arguments, s_ws, stream));
@@ -176,6 +162,9 @@ FUNC_CALL_TEMPLATE = jinja2.Template(
 
 def _tile_for_n(N):
     # SM90: swept on H200 for the trunk fp8 gemm shapes (RCR, cooperative FP8 FastAccum).
+    # Avoid padding these channel widths to a multiple of 128.
+    if N % 192 == 0:
+        return "Shape<_128, _192, Shape<_128>>"
     if N >= 256 and N % 256 == 0:
         return "Shape<_128, _256, Shape<_128>>"
     if N > 128:
@@ -183,10 +172,9 @@ def _tile_for_n(N):
     return "Shape<_128, _128, Shape<_128>>"
 
 
-# Per-arch collective-builder config. SM90 (Hopper WGMMA) uses the cooperative FP8-FastAccum
-# schedule + a per-N tile; SM100 (Blackwell tcgen05) uses the 1SM warp-specialized schedule,
-# a fixed MMA tile (M=128, N=128, K=64), and the CLC tile scheduler (extra `void` kernel arg).
-# On Blackwell fp8 fast-accumulation is intrinsic to the UMMA -- no FastAccum schedule exists.
+# Base collective configurations. gen_function adds the measured shape/M dispatch.
+# SM90 uses cooperative FP8 FastAccum; SM100 selects 1SM/2SM via the cluster
+# shape and uses the CLC scheduler (the extra void kernel argument).
 def _arch_config(func_attrs):
     from aitemplate.backend.target import Target
 
@@ -197,8 +185,8 @@ def _arch_config(func_attrs):
         # Auto+Auto is the guaranteed-compatible SM100 pairing (cutlass example 70 ships it
         # with a per-row fusion). ClusterShape M parity selects the schedule under Auto:
         # <_1,_1,_1> -> 1SM (MMA tile M=128), <_2,_1,_1> -> 2SM (MMA tile M=256, 2x MMA
-        # throughput). Our trunk M (batch*board) is always large, so 2SM can win at high batch;
-        # opt-in via AIT_FP8_GEMM_2SM=1 (default 1SM, which is safest across the batch range).
+        # throughput). Explicit AIT_FP8_GEMM_2SM overrides disable automatic dispatch;
+        # gen_function otherwise combines 1SM and 2SM for supported projection shapes.
         if os.environ.get("AIT_FP8_GEMM_2SM", "0") == "1":
             tile, cluster = "Shape<_256, _128, _64>", "Shape<_2, _1, _1>"
         else:
@@ -223,11 +211,76 @@ def _arch_config(func_attrs):
 
 @registry.reg("cuda.gemm_rcr_fp8_fused.gen_function")
 def gen_function(func_attrs):
-    return FUNC_TEMPLATE.render(
-        func_name=func_attrs["name"], N=func_attrs["N"], K=func_attrs["K"],
-        has_residual=func_attrs.get("has_residual", False),
-        **_arch_config(func_attrs),
-    )
+    import os
+    from aitemplate.backend.target import Target
+
+    name = func_attrs["name"]
+    config = _arch_config(func_attrs)
+    max_m = 1
+    for dim in func_attrs["inputs"][0]._attrs["shape"][:-1]:
+        max_m *= dim._attrs["values"][-1]
+    kwargs = dict(N=func_attrs["N"], K=func_attrs["K"], max_m=max_m,
+                  has_residual=func_attrs.get("has_residual", False))
+    # H200 graph microbenchmarks: narrow N tiles fill the SMs at small M;
+    # larger M tiles help the wide projections once multiple waves are needed.
+    # Keep these measured choices scoped to the tested projection dimensions.
+    projection_shapes = {(192, 192), (192, 384), (192, 576),
+                         (384, 192), (576, 192), (1152, 192)}
+    if Target.current()._arch == "90" and (kwargs["N"], kwargs["K"]) in projection_shapes:
+        n = kwargs["N"]
+        if n == 192:
+            choices = [(5632, 128, 64), (8192, 128, 128), (None, 128, 192)]
+        elif n == 384:
+            choices = [(2816, 128, 64), (5632, 128, 128), (None, 128, 192)]
+        elif n == 576:
+            choices = [(1792, 128, 64), (3328, 128, 128),
+                       (8192, 128, 192), (None, 256, 192)]
+        else:
+            choices = [(896, 128, 64), (10240, 128, 192), (None, 256, 192)]
+        kernels, calls = [], []
+        for index, (limit, tile_m, tile_n) in enumerate(choices):
+            variant = name + "_m" + str(index)
+            tuned = dict(config, tile=f"Shape<_{tile_m}, _{tile_n}, _128>")
+            kernels.append(FUNC_TEMPLATE.render(func_name=variant, **kwargs, **tuned))
+            call = f"{variant}(a, b, sx, sw, residual, out, M, stream);"
+            calls.append(f"  if (M <= {limit}) {{ {call} return; }}" if limit else "  " + call)
+        dispatch = (f"\nvoid {name}(const void* a, const void* b, const void* sx, const void* sw, "
+                    "const void* residual, void* out, int64_t M, cudaStream_t stream) {\n"
+                    + "\n".join(calls) + "\n}\n")
+        return "\n".join(kernels) + dispatch
+    # Small M favors the original 1SM tile; channel-aligned 2SM tiles win at
+    # large M. Keep the explicit 2SM environment override authoritative.
+    if (Target.current()._arch == "100" and func_attrs["N"] % 192 == 0
+            and "AIT_FP8_GEMM_2SM" not in os.environ):
+        tuned_shape = (kwargs["N"], kwargs["K"]) in projection_shapes
+        tiny_limit = ({192: 6144, 384: 3072, 576: 2048, 1152: 1024}[kwargs["N"]]
+                      if tuned_shape else 0)
+        tiny = ""
+        tiny_call = ""
+        if tiny_limit:
+            tiny = FUNC_TEMPLATE.render(func_name=name + "_tiny", **kwargs,
+                                        **dict(config, tile="Shape<_128, _64, _64>"))
+            tiny_call = f"  if (M <= {tiny_limit}) {{ {name}_tiny(a, b, sx, sw, residual, out, M, stream); return; }}\n"
+        small_config = dict(config)
+        if tuned_shape and kwargs["N"] in (192, 576):
+            small_config["tile"] = "Shape<_128, _96, _64>"
+        small = FUNC_TEMPLATE.render(func_name=name + "_small", **kwargs, **small_config)
+        large_k = 128 if (kwargs["N"], kwargs["K"]) == (192, 384) else 64
+        large_config = dict(config, tile=f"Shape<_256, _192, _{large_k}>",
+                            cluster="Shape<_2, _1, _1>")
+        large = FUNC_TEMPLATE.render(func_name=name + "_large", **kwargs, **large_config)
+        dispatch = f"""
+void {name}(const void* a, const void* b, const void* sx, const void* sw,
+            const void* residual, void* out, int64_t M, cudaStream_t stream) {{
+{tiny_call}  if (M < 8192) {{
+    {name}_small(a, b, sx, sw, residual, out, M, stream);
+  }} else {{
+    {name}_large(a, b, sx, sw, residual, out, M, stream);
+  }}
+}}
+"""
+        return tiny + small + large + dispatch
+    return FUNC_TEMPLATE.render(func_name=name, **kwargs, **config)
 
 
 @registry.reg("cuda.gemm_rcr_fp8_fused.func_decl")

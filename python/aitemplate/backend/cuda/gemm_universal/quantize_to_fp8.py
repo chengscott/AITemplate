@@ -6,6 +6,7 @@
 import jinja2
 
 from aitemplate.backend import registry
+from aitemplate.backend.target import Target
 
 
 def _group(C):
@@ -28,7 +29,9 @@ constexpr float kE4M3Max = 448.0f;
 // uint4 chunks (stride {{G}}); group-shuffle absmax uses offsets < {{G}} (stay in the group).
 __global__ void {{func_name}}_kernel(const uint4* __restrict__ x,
                                      uint2* __restrict__ xq,
-                                     float* __restrict__ scale, long long rows, int VECS) {
+                                     float* __restrict__ scale, long long rows, int {% if specialize %}VECS_runtime{% else %}VECS{% endif %}) {
+{% if specialize %}  constexpr int VECS = {{VECS}};
+{% endif %}
   const int lane = threadIdx.x & 31;
   const int glane = lane % {{G}};
   const int grow = lane / {{G}};
@@ -40,7 +43,8 @@ __global__ void {{func_name}}_kernel(const uint4* __restrict__ x,
   const uint4* xr = x + (active ? row : 0) * (long long)VECS;
   float amax = 0.f;
   if (active)
-    for (int v = glane; v < VECS; v += {{G}}) {
+{% if specialize %}    #pragma unroll
+{% endif %}    for (int v = glane; v < VECS; v += {{G}}) {
       uint4 q = xr[v];
       const __half2* h = reinterpret_cast<const __half2*>(&q);
 #pragma unroll
@@ -57,7 +61,8 @@ __global__ void {{func_name}}_kernel(const uint4* __restrict__ x,
   if (active && glane == 0) scale[row] = sc > 0.f ? sc : 1.0f;
   if (!active) return;
   uint2* outr = xq + row * (long long)VECS;
-  for (int v = glane; v < VECS; v += {{G}}) {
+{% if specialize %}  #pragma unroll
+{% endif %}  for (int v = glane; v < VECS; v += {{G}}) {
     uint4 q = xr[v];
     const __half2* h = reinterpret_cast<const __half2*>(&q);
     uint2 out;
@@ -76,7 +81,7 @@ __global__ void {{func_name}}_kernel(const uint4* __restrict__ x,
 // x [rows, C] f16 -> xq [rows, C] e4m3 + scale [rows] f32. C % 8 == 0. No workspace.
 void {{func_name}}(const void* x_ptr, void* xq_ptr, void* scale_ptr, int64_t rows,
                    int64_t C, cudaStream_t stream) {
-  constexpr int BLK = 128;                 // 4 warps/CTA
+  constexpr int BLK = {{256 if specialize else 128}};
   constexpr int RPW = {{RPW}};             // rows per warp
   const long long rows_per_cta = (BLK >> 5) * RPW;
   const unsigned int grid = (unsigned int)((rows + rows_per_cta - 1) / rows_per_cta);
@@ -107,7 +112,9 @@ def _C(func_attrs):
 @registry.reg("cuda.quantize_to_fp8.gen_function")
 def gen_function(func_attrs):
     g = _group(_C(func_attrs))
-    return FUNC_TEMPLATE.render(func_name=func_attrs["name"], G=g, RPW=32 // g)
+    return FUNC_TEMPLATE.render(func_name=func_attrs["name"], G=g, RPW=32 // g,
+                                VECS=_C(func_attrs) >> 3,
+                                specialize=Target.current()._arch in ("90", "100"))
 
 
 @registry.reg("cuda.quantize_to_fp8.func_decl")

@@ -10,6 +10,7 @@
 import jinja2
 
 from aitemplate.backend import registry
+from aitemplate.backend.target import Target
 
 FUNC_TEMPLATE = jinja2.Template(
     """
@@ -22,7 +23,9 @@ namespace {
 // one thread per 8 columns (uint4 = 8 halfs) of gate and up -> one uint4 store.
 __global__ void {{func_name}}_kernel(const __half* __restrict__ x, __half* __restrict__ z,
 {% if has_rrms %}                                     const __half* __restrict__ rrms,
-{% endif %}                                     long long rows, int ffn) {
+{% endif %}                                     long long rows, int {% if specialize %}ffn_runtime{% else %}ffn{% endif %}) {
+{% if specialize %}  constexpr int ffn = {{ffn_value}};
+{% endif %}
   const int ffn8 = ffn >> 3;
   const long long total = rows * (long long)ffn8;
   const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
@@ -50,7 +53,9 @@ __global__ void {{func_name}}_kernel(const __half* __restrict__ x, __half* __res
 // scalar fallback for ffn not a multiple of 8.
 __global__ void {{func_name}}_kernel_scalar(const __half* __restrict__ x, __half* __restrict__ z,
 {% if has_rrms %}                                            const __half* __restrict__ rrms,
-{% endif %}                                            long long rows, int ffn) {
+{% endif %}                                            long long rows, int {% if specialize %}ffn_runtime{% else %}ffn{% endif %}) {
+{% if specialize %}  constexpr int ffn = {{ffn_value}};
+{% endif %}
   const long long total = rows * (long long)ffn;
   const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= total) return;
@@ -70,7 +75,9 @@ __global__ void {{func_name}}_kernel_scalar(const __half* __restrict__ x, __half
 __global__ void {{func_name}}_fp8_kernel(const __half* __restrict__ x, uint2* __restrict__ zq,
                                          float* __restrict__ scale,
 {% if has_rrms %}                                         const __half* __restrict__ rrms,
-{% endif %}                                         long long rows, int ffn) {
+{% endif %}                                         long long rows, int {% if specialize %}ffn_runtime{% else %}ffn{% endif %}) {
+{% if specialize %}  constexpr int ffn = {{ffn_value}};
+{% endif %}
   const int ffn8 = ffn >> 3;                 // uint4 chunks per row (VECS)
   const int lane = threadIdx.x & 31;
   const long long r = (long long)blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
@@ -132,7 +139,7 @@ __global__ void {{func_name}}_fp8_kernel(const __half* __restrict__ x, uint2* __
 void {{func_name}}(const void* x_ptr, void* zq_ptr, void* scale_ptr,
                    {% if has_rrms %}const void* rrms_ptr, {% endif %}int64_t rows,
                    int64_t ffn, cudaStream_t stream) {
-  const int block = 128;                       // 4 warps/CTA, one warp per row
+  const int block = {{256 if specialize else 128}};  // one warp per row
   const unsigned int grid = (unsigned int)((rows + (block >> 5) - 1) / (block >> 5));
   {{func_name}}_fp8_kernel<<<grid, block, 0, stream>>>(
       reinterpret_cast<const __half*>(x_ptr), reinterpret_cast<uint2*>(zq_ptr),
@@ -190,6 +197,9 @@ def swiglu_gen_function(func_attrs):
         has_rrms=func_attrs.get("has_rrms", False),
         fp8_out=func_attrs.get("fp8_out", False),
         NCHUNK=(ffn8 + 31) // 32,
+        specialize=(Target.current()._arch in ("90", "100") or
+                    (Target.current()._arch == "80" and not func_attrs.get("fp8_out", False))),
+        ffn_value=_ffn(func_attrs),
     )
 
 

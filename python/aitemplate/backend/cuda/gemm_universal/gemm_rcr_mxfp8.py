@@ -10,6 +10,7 @@ from aitemplate.backend import registry
 
 FUNC_TEMPLATE = jinja2.Template(
     """
+
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
@@ -44,7 +45,7 @@ constexpr int AlignC = 128 / cutlass::sizeof_bits<ElementOut>::value;  // 8
 using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
     cutlass::arch::Sm100, cutlass::arch::OpClassBlockScaledTensorOp, TileShapeMNK, ClusterShapeMNK,
     cutlass::epilogue::collective::EpilogueTileAuto, ElementAcc, ElementAcc,
-    ElementOut, LayoutC, AlignC, ElementOut, LayoutC, AlignC,
+    {{'void' if source_free and not has_residual else 'ElementOut'}}, LayoutC, AlignC, ElementOut, LayoutC, AlignC,
     cutlass::epilogue::collective::EpilogueScheduleAuto>::CollectiveOp;
 using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
     cutlass::arch::Sm100, cutlass::arch::OpClassBlockScaledTensorOp,
@@ -76,11 +77,14 @@ __global__ void {{func_name}}_quant(const __half* __restrict__ a,
 {% endif %}{% if norm == 'swiglu' %}                                    const __half* __restrict__ rrms,
 {% endif %}{% if norm == 'rms_out' %}                                    __half* __restrict__ rrms_out, float eps,
 {% endif %}                                    unsigned char* __restrict__ aq,
-                                    unsigned char* __restrict__ sfa, long long rows, int nkb, int ntx) {
-  const int warps_per_cta = blockDim.x >> 5;
-  const long long row = (long long)blockIdx.x * warps_per_cta + (threadIdx.x >> 5);
+                                    unsigned char* __restrict__ sfa, long long rows, int nkb_runtime, int ntx_runtime) {
+  constexpr int nkb = {{K // 32}}, ntx = {{(K // 32 + 3) // 4}};
+  // Whole lane groups own rows. Inactive groups exit together; shuffle offsets
+  // remain inside an active group, including the final partial warp.
+  const int warps_per_cta = blockDim.x / {{GROUP}};
+  const long long row = (long long)blockIdx.x * warps_per_cta + (threadIdx.x / {{GROUP}});
   if (row >= rows) return;
-  const int lane = threadIdx.x & 31;
+  const int lane = threadIdx.x % {{GROUP}};
   const long long K = (long long)nkb * 32;
   const uint4* ar = reinterpret_cast<const uint4*>(a + row * K);   // 8 half / uint4
   uint2* aqr = reinterpret_cast<uint2*>(aq + row * K);             // 8 e4m3 / uint2
@@ -89,17 +93,19 @@ __global__ void {{func_name}}_quant(const __half* __restrict__ a,
   const uint4* gr = reinterpret_cast<const uint4*>(gamma);
   uint4 xbuf[{{NCHUNK}}][4]; float ss = 0.f;
   int bi = 0;
-  for (int kb = lane; kb < nkb; kb += 32, bi++) {
+#pragma unroll
+  for (int kb = lane; kb < nkb; kb += {{GROUP}}, bi++) {
 #pragma unroll
     for (int j = 0; j < 4; j++) { uint4 q = ar[kb * 4 + j]; xbuf[bi][j] = q; const __half2* h = reinterpret_cast<const __half2*>(&q);
 #pragma unroll
       for (int i = 0; i < 4; i++) { float2 f = __half22float2(h[i]); ss += f.x * f.x + f.y * f.y; } }
   }
 #pragma unroll
-  for (int o = 16; o > 0; o >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, o);
+  for (int o = {{GROUP // 2}}; o > 0; o >>= 1) ss += __shfl_xor_sync(__activemask(), ss, o);
   const float rrms = rsqrtf(ss / (float)K + eps);
   bi = 0;
-  for (int kb = lane; kb < nkb; kb += 32, bi++) {
+#pragma unroll
+  for (int kb = lane; kb < nkb; kb += {{GROUP}}, bi++) {
     float amax = 0.f; uint4 nb[4];
 #pragma unroll
     for (int j = 0; j < 4; j++) {
@@ -126,18 +132,20 @@ __global__ void {{func_name}}_quant(const __half* __restrict__ a,
   // rrms = rsqrt(mean(x^2)+eps) as a 2nd output (folds ops.rms_reduce -> no separate read of x).
   // unpack_rope / fc2-swiglu apply rrms downstream. One read of x (held in xbuf for the quantize).
   uint4 xbuf[{{NCHUNK}}][4]; float ss = 0.f; int bi = 0;
-  for (int kb = lane; kb < nkb; kb += 32, bi++) {
+#pragma unroll
+  for (int kb = lane; kb < nkb; kb += {{GROUP}}, bi++) {
 #pragma unroll
     for (int j = 0; j < 4; j++) { uint4 q = ar[kb * 4 + j]; xbuf[bi][j] = q; const __half2* h = reinterpret_cast<const __half2*>(&q);
 #pragma unroll
       for (int i = 0; i < 4; i++) { float2 f = __half22float2(h[i]); ss += f.x * f.x + f.y * f.y; } }
   }
 #pragma unroll
-  for (int o = 16; o > 0; o >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, o);
+  for (int o = {{GROUP // 2}}; o > 0; o >>= 1) ss += __shfl_xor_sync(__activemask(), ss, o);
   const float rrms = rsqrtf(ss / (float)K + eps);
   if (lane == 0) rrms_out[row] = __float2half(rrms);
   bi = 0;
-  for (int kb = lane; kb < nkb; kb += 32, bi++) {
+#pragma unroll
+  for (int kb = lane; kb < nkb; kb += {{GROUP}}, bi++) {
     float amax = 0.f;
 #pragma unroll
     for (int j = 0; j < 4; j++) { const __half2* h = reinterpret_cast<const __half2*>(&xbuf[bi][j]);
@@ -159,7 +167,8 @@ __global__ void {{func_name}}_quant(const __half* __restrict__ a,
   const uint4* fr = reinterpret_cast<const uint4*>(a + row * (2 * K));  // fc1 row (stride 2K halfs)
   const int upv = (int)(K >> 3);                                       // uint4 offset to up half (K/8)
   const float rf = __half2float(rrms[row]);
-  for (int kb = lane; kb < nkb; kb += 32) {
+#pragma unroll
+  for (int kb = lane; kb < nkb; kb += {{GROUP}}) {
     float amax = 0.f; uint4 zb[4];
 #pragma unroll
     for (int j = 0; j < 4; j++) {
@@ -185,7 +194,8 @@ __global__ void {{func_name}}_quant(const __half* __restrict__ a,
       aqr[kb * 4 + j] = out; }
   }
 {% else %}
-  for (int kb = lane; kb < nkb; kb += 32) {
+#pragma unroll
+  for (int kb = lane; kb < nkb; kb += {{GROUP}}) {
     uint4 buf[4]; float amax = 0.f;
 #pragma unroll
     for (int j = 0; j < 4; j++) { uint4 q = ar[kb * 4 + j]; buf[j] = q; const __half2* h = reinterpret_cast<const __half2*>(&q);
@@ -216,7 +226,7 @@ __global__ void {{func_name}}_quant(const __half* __restrict__ a,
 // A [M,{{K}}] f16 (quantized internally),
 // B [{{N}},{{K}}] e4m3 + b_scale (ue8m0 swizzled SFB, baked) -> D [M,{{N}}] f16.
 void {{func_name}}(const void* a_ptr, {% if norm == 'rmsnorm' %}const void* gamma_ptr, {% endif %}{% if norm == 'swiglu' %}const void* rrms_ptr, {% endif %}const void* b_ptr, const void* bscale_ptr,
-                   const void* residual_ptr, void* out_ptr, {% if norm == 'rms_out' %}void* rrms_out_ptr, {% endif %}int64_t M, cudaStream_t stream) {
+                   const void* residual_ptr, void* out_ptr, {% if norm == 'rms_out' %}void* rrms_out_ptr, {% endif %}int64_t M, cudaStream_t stream{% if init_dispatch %}, bool initialize_only = false{% endif %}) {
   using namespace {{func_name}}_ns;
   const int N = {{N}}, K = {{K}}, nkb = K / 32, ntx = (nkb + 3) / 4; (void)nkb; (void)ntx;
   StrideA stride_A = cutlass::make_cute_packed_stride(StrideA{}, {static_cast<int>(M), K, 1});
@@ -256,8 +266,9 @@ void {{func_name}}(const void* a_ptr, {% if norm == 'rmsnorm' %}const void* gamm
         hw_info};
     cudaMalloc(&s_ws, Gemm::get_workspace_size(size_args));
   }
-  {
-    const int BLK = 128; unsigned int g = (unsigned int)((M + (BLK >> 5) - 1) / (BLK >> 5));
+{% if init_dispatch %}  if (initialize_only) return;
+{% endif %}  {
+    const int BLK = 256; unsigned int g = (unsigned int)((M + (BLK / {{GROUP}}) - 1) / (BLK / {{GROUP}}));
     {{func_name}}_quant<<<g, BLK, 0, stream>>>(reinterpret_cast<const __half*>(a_ptr),
 {% if norm == 'rmsnorm' %}                                               reinterpret_cast<const __half*>(gamma_ptr), {{eps}}f,
 {% endif %}{% if norm == 'swiglu' %}                                               reinterpret_cast<const __half*>(rrms_ptr),
@@ -320,13 +331,97 @@ def gen_function(func_attrs):
     max_m = 1
     for d in func_attrs["inputs"][0]._attrs["shape"][:-1]:
         max_m *= d._attrs["values"][-1]
-    return FUNC_TEMPLATE.render(
+    kwargs = dict(
+        GROUP=min(32, 1 << (nkb - 1).bit_length()),
         func_name=func_attrs["name"], N=func_attrs["N"], K=K,
         has_residual=func_attrs.get("has_residual", False),
         norm=func_attrs.get("norm", "none"), relu_stmt=relu_stmt,
         NCHUNK=(nkb + 31) // 32, eps=func_attrs.get("eps", 1e-6), max_m=max_m,
         tile=tile, cluster=cluster,
     )
+    import os
+
+    if func_attrs["N"] % 192 == 0 and "AIT_FP8_GEMM_2SM" not in os.environ:
+        name = func_attrs["name"]
+        kwargs["init_dispatch"] = True
+        small = FUNC_TEMPLATE.render(**dict(kwargs, func_name=name + "_small"))
+        large = FUNC_TEMPLATE.render(**dict(
+            kwargs, func_name=name + "_large", tile="Shape<_256, _192, _128>",
+            cluster="Shape<_2, _1, _1>"))
+        params = [("const void*", "a")]
+        mode = func_attrs.get("norm", "none")
+        if mode == "rmsnorm":
+            params.append(("const void*", "gamma"))
+        if mode == "swiglu":
+            params.append(("const void*", "rrms"))
+        params.extend([("const void*", "b"), ("const void*", "bs"),
+                       ("const void*", "residual"), ("void*", "out")])
+        if mode == "rms_out":
+            params.append(("void*", "rrms_out"))
+        params.extend([("int64_t", "M"), ("cudaStream_t", "stream")])
+        signature = ", ".join(f"{dtype} {arg}" for dtype, arg in params)
+        arguments = ", ".join(arg for _, arg in params)
+        # Small-M graph measurements favor N=64 until the narrow tiles need
+        # another CTA wave. Keep larger M on the established 1SM/2SM tiles.
+        measured_shapes = {(192, 192), (192, 384), (192, 576),
+                           (384, 192), (576, 192), (1152, 192)}
+        tiny_limit = ({192: 6144, 384: 3072, 576: 2048, 1152: 1024}[func_attrs["N"]]
+                      if (func_attrs["N"], K) in measured_shapes else 0)
+        tiny = ""
+        tiny_call = ""
+        # FlashInfer's SM100 sweep identified multicast clusters that improve
+        # full-model latency for M<=648. Keep the established
+        # dispatch above that range: GEMM-only gains did not reliably transfer.
+        # Preserve the native quantize/RMS/SwiGLU and residual fusions.
+        # Opt-in: the full graph still regresses at some larger batches despite
+        # unchanged dispatch there. Do not enable by default from GEMM timings.
+        fi_tiles = {
+            (192, 192): (128, 64, 128, 1, 2),
+            (192, 384): (128, 64, 128, 1, 4),
+            (192, 576): (256, 64, 128, 2, 2),
+            (384, 192): (128, 64, 128, 1, 4),
+            (576, 192): (128, 64, 128, 1, 2),
+            (1152, 192): (128, 64, 128, 1, 2),
+        }
+        fi_config = fi_tiles.get((func_attrs["N"], K))
+        fi, fi_call = "", ""
+        if fi_config and os.environ.get("AIT_MXFP8_FLASHINFER", "0") == "1":
+            m, n, k, cm, cn = fi_config
+            fi = FUNC_TEMPLATE.render(**dict(
+                kwargs, func_name=name + "_fi", source_free=True,
+                max_m=min(max_m, 648), tile=f"Shape<_{m}, _{n}, _{k}>",
+                cluster=f"Shape<_{cm}, _{cn}, _1>"))
+            fi_call = f"  if (M <= 648) {{ {name}_fi({arguments}); return; }}\n"
+        if tiny_limit:
+            tiny = FUNC_TEMPLATE.render(**dict(kwargs, func_name=name + "_tiny",
+                                               tile="Shape<_128, _64, _128>"))
+            tiny_call = f"  if (M <= {tiny_limit}) {{ {name}_tiny({arguments}); return; }}\n"
+        initializers = [name + "_small", name + "_large"]
+        if tiny_limit:
+            initializers.insert(0, name + "_tiny")
+        if fi:
+            initializers.insert(0, name + "_fi")
+        initialize_calls = "\n".join(
+            f"    {variant}({arguments}, true);" for variant in initializers
+        )
+        dispatch = f"""
+void {name}({signature}) {{
+  // Initialize every variant on the first eager call. Later batch transitions
+  // may happen inside CUDA graph capture, where cudaMalloc is prohibited.
+  thread_local static bool initialized = false;
+  if (!initialized) {{
+{initialize_calls}
+    initialized = true;
+  }}
+{fi_call}{tiny_call}  if (M < 8192) {{
+    {name}_small({arguments});
+  }} else {{
+    {name}_large({arguments});
+  }}
+}}
+"""
+        return fi + tiny + small + large + dispatch
+    return FUNC_TEMPLATE.render(**kwargs)
 
 
 @registry.reg("cuda.gemm_rcr_mxfp8.func_decl")
