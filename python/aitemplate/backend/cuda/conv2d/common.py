@@ -979,6 +979,25 @@ def extract_config(
                 and op.accumulator_type() == acc_type
             ):
                 return ret
+            # The 3.x conv loads operands via TMA, which needs each operand's
+            # contiguous (channel) extent aligned to tma_alignment_bytes (16B) -- i.e.
+            # 16/sizeof(element) elements (8 for f16/bf16). On SM100 do not emit a 3.x
+            # candidate for a shape whose input- or output-channel count violates that
+            # alignment (e.g. a 20-channel stem conv): the candidate would be pruned as
+            # un-implementable during profiling and, having displaced the 2.x
+            # candidates, leave the shape with no kernel at all (StopIteration).
+            # Skipping 3.x here keeps such shapes 2.x-only (a valid pure-2.x source) --
+            # see the arch-100 conv-candidate split at the conv_ops assembly below.
+            if Target.current()._arch == "100":
+                elem_bits = cutlass_lib.library.DataTypeSize[data_type]
+                tma_align = max(1, 128 // elem_bits)  # 16 bytes / elem_size
+                w_shape = func_attrs["inputs"][1]._attrs["shape"]
+                out_ch = w_shape[0]._attrs["values"]
+                in_ch = w_shape[3]._attrs["values"]
+                if (len(in_ch) == 1 and in_ch[0] % tma_align != 0) or (
+                    len(out_ch) == 1 and out_ch[0] % tma_align != 0
+                ):
+                    return ret
             op = copy.deepcopy(op)
             epilogue_name = func_attrs["epilogue"]
             # apply special config if required (sets activation/binary/unary_op
@@ -989,21 +1008,38 @@ def extract_config(
             op._ait_fusion_cpp = fusion_cpp
             op._ait_is_residual = is_residual
             ret.append(op)
-            # Add channel-aligned alternatives for 192-channel SM90/SM100
-            # convolution trunks. Profile alongside the original tiles so
-            # each shape retains its fastest option.
+            # Tile-N alternatives for the f16 SM90/SM100 conv trunk. The GEMM's N
+            # dimension is the conv's output-channel count C, so the fixed default
+            # N=128 tile is a poor fit for most trunks: it wastes lanes when C is not
+            # a multiple of 128 (C=96 uses only 96/128 of N), and for large C it
+            # under-splits N. Derive candidate tile-N sizes from C instead of
+            # hard-coding them:
+            #   * every standard MMA-N tile up to C -- gives more CTAs to fill the
+            #     SMs when M (batch*spatial) is small, and
+            #   * C itself when it is a valid MMA-N -- an exact fit with zero wasted
+            #     N lanes, best for large M,
+            # plus a 2SM-cluster variant of the largest tile on SM100 for extra MMA
+            # throughput at large M. The profiler keeps the fastest per shape. This is
+            # a superset of the default candidate (N=128 always survives via the base
+            # op), so it can only match or beat the previous pick.
             td = op.tile_description
             co = func_attrs["inputs"][1]._attrs["shape"][0]._attrs["values"]
+            C = co[0] if len(co) == 1 else 0
+            STD_TILE_NS = (64, 128, 192)  # valid MMA-N tiles, mult of 32, <= 256
             if (
                 Target.current()._arch in ("90", "100")
                 and data_type == cutlass_lib.library.DataType.f16
                 and acc_type == cutlass_lib.library.DataType.f32
                 and list(td.cluster_shape) == [1, 1, 1]
                 and list(td.tile_shape) in ([64, 128, 64], [128, 128, 64])
-                and len(co) == 1
-                and co[0] % 192 == 0
+                and C >= 64
+                and C % 32 == 0
             ):
-                for tile_n in (64, 192):
+                tile_ns = sorted(
+                    {n for n in STD_TILE_NS if n <= C}
+                    | ({C} if C <= max(STD_TILE_NS) else set())
+                )
+                for tile_n in tile_ns:
                     aligned = copy.deepcopy(op)
                     atd = aligned.tile_description
                     atd.threadblock_shape = [td.tile_shape[0], tile_n, 64]
@@ -1013,7 +1049,7 @@ def extract_config(
                     if (
                         Target.current()._arch == "100"
                         and td.tile_shape[0] == 128
-                        and tile_n == 192
+                        and tile_n == tile_ns[-1]
                     ):
                         # Conv3x stores the per-CTA M extent here. Its emitter
                         # doubles M for a 2-SM instruction: 128 -> MMA M=256.
@@ -1066,6 +1102,23 @@ def extract_config(
                 for op_inst in ret:
                     key = kernel_name(op_inst, layout=op_layout)
                     conv_ops[key] = op_inst
+
+    # On Blackwell (SM100) the CUTLASS 4.x conv library still ships the legacy 2.x
+    # kernels (ImplicitGemmConvolution / DefaultConv2dFprop[WithBroadcast]), but
+    # AITemplate's conv function codegen emits a source that is 2.x XOR 3.x -- it
+    # cannot mix the two APIs in one .cu. So per conv shape, prefer the native 3.x
+    # ConvUniversal candidates whenever the shape produced any (they win on tcgen05
+    # and compile cleanly), and fall back to the 2.x candidates only for shapes with
+    # NO 3.x option -- e.g. align<8 input channels, which the align-8-only 3.x TMA
+    # conv cannot serve. Those all-2.x shapes then emit a pure 2.x source that builds
+    # (the sm80-tagged kernel's Ampere MMA is valid on sm_100a). Without this split a
+    # 2.x candidate can land in a 3.x-include source -> "no member" compile error.
+    if Target.current()._arch == "100" and any(
+        getattr(o, "is_3x", False) for o in conv_ops.values()
+    ):
+        conv_ops = OrderedDict(
+            (k, o) for k, o in conv_ops.items() if getattr(o, "is_3x", False)
+        )
     return conv_ops
 
 

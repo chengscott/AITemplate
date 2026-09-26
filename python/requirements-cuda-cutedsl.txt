@@ -1,0 +1,5 @@
+# CUDA 13 build dependencies for CuTe GEMM epilogues.
+# Requires a PyTorch build compatible with the selected Python version.
+quack-kernels==0.6.5
+nvidia-cutlass-dsl==4.7.1
+nvidia-cutlass-dsl-libs-cu13==4.7.1

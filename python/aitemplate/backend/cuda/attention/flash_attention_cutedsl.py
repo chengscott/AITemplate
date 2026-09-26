@@ -55,7 +55,7 @@ _LOGGER = logging.getLogger(__name__)
 # =============================================================================
 
 
-def _aot_compile_cutedsl_kernel(output_dir, func_name, head_dim, is_causal, arch, seq_len=None):
+def _aot_compile_cutedsl_kernel(output_dir, func_name, head_dim, is_causal, arch, seq_len=None, heads=None):
     """AOT-compile the FA4 forward for (head_dim, is_causal, arch); return (.h, .o).
 
     ``arch`` picks FA4's SM90 (Hopper) forward when >= 90, else the SM80 (Ampere)
@@ -87,7 +87,12 @@ def _aot_compile_cutedsl_kernel(output_dir, func_name, head_dim, is_causal, arch
             _sys.modules["cutlass.utils.ampere_helpers"] = _ah
             _cu_utils.ampere_helpers = _ah
 
-    if arch >= 100:
+    short_attention = arch in (90, 100) and head_dim == 16 and seq_len == 81 and heads == 12 and not is_causal
+    if short_attention:
+        from aitemplate.backend.cuda.attention.cutedsl_flash_attention_short import (
+            FlashAttentionShortAot as _FlashAttentionFwdAot,
+        )
+    elif arch >= 100:
         from aitemplate.backend.cuda.attention.cutedsl_flash_attention_sm100 import (
             FlashAttentionFwdSm100Aot as _FlashAttentionFwdAot,
         )
@@ -120,6 +125,7 @@ def _aot_compile_cutedsl_kernel(output_dir, func_name, head_dim, is_causal, arch
         is_causal=is_causal,
         dtype=cutlass.Float16,
         seq_len=seq_len,
+        **({"arch": arch} if short_attention else {}),
     )
     cu_stream = cuda_drv.CUstream(torch.cuda.current_stream().cuda_stream)
 
@@ -484,6 +490,7 @@ def flash_attention_qkv_gen_function_cutedsl(func_attrs: Dict[str, Any]) -> str:
         is_causal=bool(func_attrs["causal"]),
         arch=arch,
         seq_len=func_attrs.get("seq_len"),
+        heads=func_attrs["heads"] if func_attrs.get("use_short_tiles", True) else None,
     )
     func_attrs["cutedsl_obj_path"] = o_path
     sig = FA4_QKV_SIGNATURE.render(func_name=func_name)

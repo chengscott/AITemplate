@@ -403,6 +403,16 @@ class gemm(Operator):
                     for k in range(1, n_buckets)
                 }
             )
+            policy = os.environ.get("AIT_GEMM_M_BUCKET_POLICY", "log")
+            if policy == "large":
+                # Keep the small-shape buckets and sample the upper half more
+                # densely when throughput at large dynamic shapes is the priority.
+                edges = sorted(
+                    set(edges)
+                    | {max(dlo, dhi * fraction // 8) for fraction in (4, 5, 6, 7)}
+                )
+            elif policy != "log":
+                raise ValueError("AIT_GEMM_M_BUCKET_POLICY must be log or large")
             prev = dlo
             for edge in edges:
                 if edge < prev:
@@ -801,8 +811,8 @@ class gemm(Operator):
                 self._attrs["exec_path"][wkl].algo = algo
                 self._attrs["workspace"] = 102400
             elif self._attrs["exec_path"][wkl].algo != "":
-                # we have cached best algo
-                return
+                # This bucket is cached; later buckets may still need profiling.
+                continue
             else:
                 self._profile_single_workload(
                     profiler_prefix, wkl, profiler_runner, force_cache

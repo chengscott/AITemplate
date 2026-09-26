@@ -16,12 +16,13 @@ from aitemplate.compiler.base import Operator, Tensor
 class flash_attention_qkv(Operator):
     """O = FA4(Q,K,V), Q/K/V/O contiguous [B,S,H,D]; scale=head_dim**-0.5 baked."""
 
-    def __init__(self, seq_len, causal=False) -> None:
+    def __init__(self, seq_len, causal=False, use_short_tiles=True) -> None:
         super().__init__()
         self._attrs["op"] = "flash_attention_qkv"
         self._attrs["has_profiler"] = False
         self._attrs["seq_len"] = int(seq_len)
         self._attrs["causal"] = bool(causal)
+        self._attrs["use_short_tiles"] = bool(use_short_tiles)
 
     def __call__(self, q: Tensor, k: Tensor, v: Tensor) -> Tensor:
         """q,k,v: [B,S,H,D] (post-RoPE), contiguous. Returns O: [B,S,H,D]."""
@@ -42,7 +43,11 @@ class flash_attention_qkv(Operator):
         return output
 
     def _get_op_attributes(self):
-        return {"seq_len": self._attrs["seq_len"], "causal": self._attrs["causal"]}
+        return {
+            "seq_len": self._attrs["seq_len"],
+            "causal": self._attrs["causal"],
+            "use_short_tiles": self._attrs["use_short_tiles"],
+        }
 
     def gen_function(self) -> str:
         target = backend.target.Target.current()

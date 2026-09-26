@@ -86,7 +86,10 @@ class FlashAttentionFwdSm90Aot:
             # Short, narrow-head attention is faster with cp.async + mma.sync
             # than Hopper's producer/MMA warpgroups. The 64-key tile has small
             # FP16 rounding differences versus the native 128-key reduction.
-            from cutlass.base_dsl.arch import Arch
+            try:
+                from cutlass.base_dsl.arch import Arch
+            except ModuleNotFoundError:
+                from cutlass.base_dsl.enums import Arch
 
             from .cutedsl_flash_attention_sm80 import FlashAttentionFwdSm80Aot
 

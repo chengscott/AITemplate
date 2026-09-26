@@ -17,6 +17,7 @@ SQLite backend for conv/gemm profiling cache
 """
 
 import enum
+import json
 import logging
 import sqlite3
 from typing import Any, Dict, Tuple
@@ -534,6 +535,11 @@ class ProfileCacheDB:
         self._create_conv_table()
         self._create_conv3d_table()
         self._create_norm_table()
+        self._con.execute(
+            f"CREATE TABLE IF NOT EXISTS {self._target}_native_fusion "
+            "(cache_key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+        )
+        self._con.commit()
 
     @property
     def gemm_cache_version(self) -> int:
@@ -917,6 +923,20 @@ class ProfileCacheDB:
         )
         insert_sql = NORM_INSERT_TEMPLATE.render(dev=self._target, **args)
         self._insert(query_sql, insert_sql)
+
+    def query_native_fusion(self, args):
+        row = self._con.execute(
+            f"SELECT value FROM {self._target}_native_fusion WHERE cache_key = ?",
+            (args["key"],),
+        ).fetchone()
+        return json.loads(row[0]) if row else None
+
+    def insert_native_fusion(self, args):
+        with self._con:
+            self._con.execute(
+                f"INSERT OR REPLACE INTO {self._target}_native_fusion (cache_key, value) VALUES (?, ?)",
+                (args["key"], json.dumps(args["value"], sort_keys=True)),
+            )
 
     def __del__(self):
         self._con.commit()

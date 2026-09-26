@@ -151,10 +151,13 @@ class CUDA(Target):
         # arch-conditional and abort at runtime unless compiled for the `sm_90a`
         # target (not plain `sm_90`). Under AIT_FORCE_CUTLASS_SM90_KERNELS=1 we
         # generate native SM90 3.x conv / gemm / fp8 kernels, so the whole build
-        # must target 90a. Gated on the FORCE flag so FORCE=0 (sm_90) builds remain
-        # byte-identical.
+        # must target 90a. The explicit native fusion backend also requires
+        # these instructions, independently of profiler candidate selection.
         nvcc_arch = self._arch
-        if nvcc_arch == "90" and environ.force_cutlass_sm90_kernels():
+        if nvcc_arch == "90" and (
+            environ.force_cutlass_sm90_kernels()
+            or os.environ.get("AIT_FUSED_GEMM_BACKEND") == "cutlass"
+        ):
             nvcc_arch = "90a"
         elif nvcc_arch == "100":
             # CUTLASS SM100 (Blackwell) UMMA/tcgen05 kernels are arch-conditional

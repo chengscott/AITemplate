@@ -68,3 +68,7 @@ from aitemplate.backend.cuda.gemm_universal import (
 )
 
 from aitemplate.backend.cuda.gemm_universal import rms_consumers
+
+from . import gemm_rms_swiglu
+from . import gemm_rms_relu_gemm
+from . import gemm_mxfp8_swiglu

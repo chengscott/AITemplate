@@ -22,7 +22,7 @@ import pathlib
 import shutil
 import tempfile
 from enum import IntEnum
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 from aitemplate.backend import registry
 from aitemplate.backend.profiler_cache import ProfileCacheDB
@@ -379,26 +379,28 @@ class Target:
 
     def query_profile_cache(
         self, op_class: str, args: Dict[str, Any]
-    ) -> Tuple[str, int]:
+    ) -> Optional[Union[Tuple, Dict[str, Any]]]:
         """Query the profile cache for the given op class and args.
 
         Parameters
         ----------
         op_class : str
-            Op class name. gemm, conv or normalization
+            Op class name: gemm, conv, conv3d, normalization, or native_fusion
         args : Dict[str, Any]
             Op arguments.
 
         Returns
         -------
-        Tuple[str, int]
-            Queried best profiling results.
+        tuple, dict, or None
+            Best profiling results, a native fusion record, or a cache miss.
 
         Raises
         ------
         NotImplementedError
             If op class is not supported, raise error.
         """
+        if op_class == "native_fusion":
+            return self._profile_cache.query_native_fusion(args)
         if op_class == "gemm":
             return self._profile_cache.query_gemm(args)
         if op_class == "conv":
@@ -411,7 +413,9 @@ class Target:
 
     def insert_profile_cache(self, op_class: str, args: Dict[str, Any]):
         """Insert the profile cache for the given op class and args."""
-        if op_class == "gemm":
+        if op_class == "native_fusion":
+            self._profile_cache.insert_native_fusion(args)
+        elif op_class == "gemm":
             self._profile_cache.insert_gemm(args)
         elif op_class == "conv":
             self._profile_cache.insert_conv(args)
