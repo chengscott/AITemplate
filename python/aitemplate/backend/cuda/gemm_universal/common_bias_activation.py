@@ -27,11 +27,11 @@ from aitemplate.backend.target import Target
 
 
 class _LinCombPerColBiasEltActFunctor:
-    """SM100 EVT epilogue: D = act(alpha*acc + beta*C + per-column bias).
+    """SM90/SM100 EVT epilogue: D = act(alpha*acc + beta*C + per-column bias).
 
     The activation counterpart of gemm_rcr_bias._LinCombPerColBiasFunctor -- emitted as
-    the collective epilogue's fusion Operation for the CUTLASS 3.x SM100 path (SM100 has
-    no BiasElementwise schedule). ``activation`` is the cutlass epilogue activation tag,
+    the collective epilogue's fusion Operation for the CUTLASS 3.x TMA path.
+    ``activation`` is the CUTLASS epilogue activation tag,
     e.g. ``cutlass::epilogue::thread::ReLu``.
     """
 
@@ -63,11 +63,11 @@ using elem_output_type = {{elem_output_type}};
 )
 
 
-# Shared SM100 (Blackwell) 3.x problem args for all bias+activation gemms: the
+# Shared EVT 3.x problem args for bias+activation GEMMs: the
 # LinCombPerColBiasEltAct fusion Arguments (activation is compile-time in the functor,
 # so the runtime args are identical to plain LinCombPerColBias). Non-transposed problem;
-# per-column bias broadcast. Used for arch=="100" in place of each op's SM90 template.
-SM100_PROBLEM_ARGS_TEMPLATE_CUTLASS_3X = jinja2.Template(
+# per-column bias broadcast. Legacy bias schedules use each op's transposed template.
+EVT_PROBLEM_ARGS_TEMPLATE_CUTLASS_3X = jinja2.Template(
     """
     cutlass::gemm::GemmUniversalMode::kGemm,                     // GemmUniversalMode mode
     {
@@ -102,12 +102,17 @@ SM100_PROBLEM_ARGS_TEMPLATE_CUTLASS_3X = jinja2.Template(
 )
 
 
+def activation_use_evt():
+    return Target.current()._arch in ("90", "100")
+
+
 def gemm_rcr_config(
     func_attrs,
     dtype="float16",
     include_cutlass_3x_ops=False,
     activation_tag=None,
 ):
+    func_attrs.pop("profile_cache_namespace", None)
     common.make_fproc(
         func_attrs=func_attrs,
         layout=RCR,
@@ -118,7 +123,7 @@ def gemm_rcr_config(
 
     lib = cutlass_lib.library
     bias_map = lib.EpilogueScheduleBiasElementwiseMapping
-    evt = Target.current()._arch == "100"  # activation EVT: SM100 only (Sm90 relu FusionCallbacks::Arguments is nested/tuple, not the flat LinCombPerColBias form -- genuine cutlass mismatch, see gb200-sm100-port memory)
+    evt = activation_use_evt()
     drop = []
     for name, op in func_attrs["op_instance"].items():
         if common.has_tma_epilogue(op):
@@ -127,6 +132,16 @@ def gemm_rcr_config(
                 # (LinCombPerColBiasEltAct), non-transposed. Ops without a mapped activation
                 # (e.g. mul) drop -> SM80 fallback.
                 if activation_tag is not None:
+                    if Target.current()._arch == "90":
+                        func_attrs["profile_cache_namespace"] = "sm90_bias_activation_evt_v1"
+                        # Legacy Elementwise schedules ignore the fusion operation.
+                        # Restore the TMA schedule so the builder uses our bias EVT.
+                        cooperative = "Cooperative" in op.epilogue_schedule.name
+                        op.epilogue_schedule = (
+                            lib.EpilogueScheduleType.TmaWarpSpecializedCooperative
+                            if cooperative
+                            else lib.EpilogueScheduleType.TmaWarpSpecialized
+                        )
                     op.epilogue_functor = _LinCombPerColBiasEltActFunctor(
                         activation=activation_tag,
                         element_output=lib.DataTypeTag[op.D.element],
@@ -168,8 +183,8 @@ def gen_profiler(
         elem_output_type=elem_output_type,
     )
     tmpl_3x = (
-        SM100_PROBLEM_ARGS_TEMPLATE_CUTLASS_3X
-        if Target.current()._arch == "100"
+        EVT_PROBLEM_ARGS_TEMPLATE_CUTLASS_3X
+        if activation_use_evt()
         else problem_args_template_cutlass_3x
     )
     return gemm_rcr.common_gen_profiler(
@@ -210,8 +225,8 @@ def gen_function(
     problem_args_cutlass_3x = ""
     if problem_args_template_cutlass_3x is not None:
         tmpl_3x = (
-            SM100_PROBLEM_ARGS_TEMPLATE_CUTLASS_3X
-            if Target.current()._arch == "100"
+            EVT_PROBLEM_ARGS_TEMPLATE_CUTLASS_3X
+            if activation_use_evt()
             else problem_args_template_cutlass_3x
         )
         problem_args_cutlass_3x = tmpl_3x.render(

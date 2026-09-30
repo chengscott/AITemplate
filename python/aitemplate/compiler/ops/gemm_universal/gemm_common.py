@@ -55,6 +55,17 @@ from aitemplate.utils import alignment, environ
 _LOGGER = logging.getLogger(__name__)
 
 
+def _profile_cache_key(func_attrs, key):
+    """Separate backend variants without invalidating unrelated GEMM profiles."""
+    namespace = func_attrs.get("profile_cache_namespace")
+    if (
+        os.environ.get("AIT_SM90_ALLOW_SM80_GEMM", "1") != "1"
+        and backend.target.Target.current()._arch == "90"
+    ):
+        namespace = f"{namespace}:sm90_native_only" if namespace else "sm90_native_only"
+    return f"{namespace}:{key}" if namespace else key
+
+
 def split_k_result_getter(result):
     return result[1].duration
 
@@ -396,6 +407,15 @@ class gemm(Operator):
             ((dname, dvals),) = dynamic_dims.items()
             dlo, dhi = min(dvals), max(dvals)
             lo_log = math.log(max(dlo, 1))
+            # A backend can request finer sampling across a wide dynamic range
+            # without encoding model-specific dispatch thresholds.
+            max_ratio = self._attrs.get("max_profile_bucket_ratio")
+            if max_ratio is not None:
+                if not math.isfinite(max_ratio) or max_ratio <= 1:
+                    raise ValueError("max_profile_bucket_ratio must be finite and greater than one")
+                n_buckets = max(
+                    n_buckets, math.ceil(math.log(dhi / max(dlo, 1)) / math.log(max_ratio))
+                )
             edges = sorted(
                 {dlo, dhi}
                 | {
@@ -472,7 +492,9 @@ class gemm(Operator):
 
         op_type = self._attrs["op"]
         all_op_names = list(self._attrs["op_instance"].keys())
-        encoded_str = sha1((";".join(all_op_names)).encode("utf-8")).hexdigest()
+        encoded_str = sha1(
+            _profile_cache_key(self._attrs, ";".join(all_op_names)).encode("utf-8")
+        ).hexdigest()
 
         if target.use_dummy_profiling_results():
             # we don't use cache
@@ -502,7 +524,7 @@ class gemm(Operator):
             tmp_op = new_op_instance[tmp_key]
             build_profiler = False
             for wkl in workloads:
-                exec_entry_sha1 = sha1(wkl.encode("utf-8")).hexdigest()
+                exec_entry_sha1 = sha1(_profile_cache_key(self._attrs, wkl).encode("utf-8")).hexdigest()
                 query = GemmQueryEntry(
                     # 1 is subtracted from the type enum values for consistency with the existing
                     # cache databases; due to the "void" type being added to the DataType enum as
@@ -690,7 +712,7 @@ class gemm(Operator):
         target = backend.target.Target.current()
         tmp_key = next(iter(self._attrs["op_instance"].keys()))
         tmp_op = self._attrs["op_instance"][tmp_key]
-        exec_entry_sha1 = sha1(exec_key.encode("utf-8")).hexdigest()
+        exec_entry_sha1 = sha1(_profile_cache_key(self._attrs, exec_key).encode("utf-8")).hexdigest()
         split_k = 1 if self._attrs["split_k"] is None else self._attrs["split_k"]
         # Because we call gen_profiler to generate and compile all profilers
         # before running any of them, we won't be able to update the exec_path
@@ -973,9 +995,10 @@ class GemmProfilerPostprocessingDelegate:
             )
 
             tmp_op = next(iter(func_attrs["op_instance"].values()))
-            exec_entry_sha1 = sha1(exec_key.encode("utf-8")).hexdigest()
+            exec_entry = _profile_cache_key(func_attrs, exec_key)
+            exec_entry_sha1 = sha1(exec_entry.encode("utf-8")).hexdigest()
             cache_record = GemmRecordEntry(
-                exec_entry=exec_key,
+                exec_entry=exec_entry,
                 exec_entry_sha1=exec_entry_sha1,
                 # 1 is subtracted from the type enum values for consistency with the existing
                 # cache databases; due to the "void" type being added to the DataType enum as

@@ -182,7 +182,11 @@ void {{function_name}} (
     void* d_ptr,
 {% endif %}
     void* c_ptr,
+{% if is_profiler and profile_with_cuda_graph %}
+    cutlass::device_memory::allocation<uint8_t>& profiler_workspace,
+{% else %}
     uint8_t* workspace,
+{% endif %}
 {% if support_split_k %}
     int split_k,
 {% endif %}
@@ -243,8 +247,13 @@ EXEC_TEMPLATE = jinja2.Template(
 
 {% if is_profiler %}
 {{indent}}size_t workspace_size = gemm_op.get_workspace_size(arguments);
+{% if profile_with_cuda_graph %}
+{{indent}}if (profiler_workspace.size() < workspace_size) profiler_workspace.reset(workspace_size);
+{{indent}}uint8_t* workspace = profiler_workspace.get();
+{% else %}
 {{indent}}cutlass::device_memory::allocation<uint8_t> local_workspace(workspace_size);
 {{indent}}workspace = local_workspace.get();
+{% endif %}
 {{indent}}GLOBAL_WORKSPACE_SIZE = workspace_size;
 {% else %}
 {{indent}}{{instance}} gemm_op;
@@ -299,7 +308,11 @@ FUNC_CALL_TEMPLATE = jinja2.Template(
 {{indent}}    {{bias_ptr}},
 {% endif %}
 {{indent}}    {{c_ptr}},
+{% if is_profiler and profile_with_cuda_graph %}
+{{indent}}    resources.workspace,
+{% else %}
 {{indent}}    global_workspace_,
+{% endif %}
 {{indent}}    {{split_k}},
 {% for dim in adims %}
 {{indent}}    {{dim}},
@@ -385,8 +398,41 @@ PROFILER_TEMPLATE = jinja2.Template(
 size_t GLOBAL_WORKSPACE_SIZE = 0;
 
 #include <sstream>
+#include <algorithm>
 
 {{op_func}}
+
+{% if profile_with_cuda_graph %}
+struct ProfilerGraphResources {
+  // One allocation per benchmark candidate, retained through capture and replay.
+  cutlass::device_memory::allocation<uint8_t> workspace;
+  cudaStream_t stream = nullptr;
+  cudaGraph_t graph = nullptr;
+  cudaGraphExec_t executable = nullptr;
+  cudaEvent_t start = nullptr, end = nullptr;
+  static void check(cudaError_t status) {
+    if (status != cudaSuccess) throw std::runtime_error(cudaGetErrorString(status));
+  }
+  ~ProfilerGraphResources() {
+    if (stream) {
+      cudaStreamCaptureStatus status;
+      if (cudaStreamIsCapturing(stream, &status) == cudaSuccess &&
+          status != cudaStreamCaptureStatusNone) {
+        cudaGraph_t abandoned = nullptr;
+        cudaStreamEndCapture(stream, &abandoned);
+        if (abandoned) cudaGraphDestroy(abandoned);
+      }
+      // Error paths may leave work in flight. Finish it before freeing workspace.
+      cudaStreamSynchronize(stream);
+    }
+    if (executable) cudaGraphExecDestroy(executable);
+    if (graph) cudaGraphDestroy(graph);
+    if (start) cudaEventDestroy(start);
+    if (end) cudaEventDestroy(end);
+    if (stream) cudaStreamDestroy(stream);
+  }
+};
+{% endif %}
 
 template <typename DType>
 struct ProfilerMemoryPool;
@@ -437,10 +483,40 @@ int benchmark_{{function_name}} (
     cudaStream_t stream
 {% endif %}
   ) {
+{% if profile_with_cuda_graph %}
+  ProfilerGraphResources resources;
+  auto check = ProfilerGraphResources::check;
+  check(cudaDeviceSynchronize()); // finish memory-pool initialization
+  check(cudaStreamCreateWithFlags(&resources.stream, cudaStreamNonBlocking));
+  stream = resources.stream;
+{% endif %}
   // warmup
   for (int i = 0; i < 5; ++i) {
     {{func_call}}
   }
+{% if profile_with_cuda_graph %}
+  check(cudaStreamSynchronize(stream));
+  check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
+  for (int i = 0; i < 100; ++i) {
+    {{func_call}}
+  }
+  check(cudaStreamEndCapture(stream, &resources.graph));
+  check(cudaGraphInstantiate(&resources.executable, resources.graph, nullptr, nullptr, 0));
+  check(cudaGraphLaunch(resources.executable, stream));
+  check(cudaEventCreate(&resources.start));
+  check(cudaEventCreate(&resources.end));
+  float samples[7];
+  for (int i = 0; i < 7; ++i) {
+    check(cudaEventRecord(resources.start, stream));
+    check(cudaGraphLaunch(resources.executable, stream));
+    check(cudaEventRecord(resources.end, stream));
+    check(cudaEventSynchronize(resources.end));
+    check(cudaEventElapsedTime(&samples[i], resources.start, resources.end));
+  }
+  std::sort(samples, samples + 7);
+  // Preserve the profiler's existing ten-invocation timing convention.
+  float runtime_ms = samples[3] / 10;
+{% else %}
   cudaEvent_t events[2];
   for (auto & event : events) {
     cudaEventCreate(&event);
@@ -456,6 +532,7 @@ int benchmark_{{function_name}} (
   for (auto event : events) {
     (void)cudaEventDestroy(event);
   }
+{% endif %}
   // TODO: output workspace
   if (runtime_ms < 0.00001) {
       throw std::runtime_error(
@@ -483,6 +560,10 @@ struct ProfilerMemoryPool {
   ~ProfilerMemoryPool() {}
 
   int64_t ComputeMemPoolSize(size_t one_copy_sz, size_t ptr_max_sz, size_t l2_cache_bytes) {
+{% if profile_with_cuda_graph %}
+    // Graph replay reuses each tensor; separate allocations preserve non-aliasing.
+    return 1;
+{% endif %}
     int times_covers_l2_cache = (int)std::ceil(l2_cache_bytes / sizeof(DType) / ptr_max_sz);
     int64_t mem_pool_sz = std::max(2, std::min(512, times_covers_l2_cache));
     size_t free_global_mem = 0;
@@ -1169,6 +1250,7 @@ def gen_profiler(
     has_bias = bias_ptr_arg is not None
     instance_name_base = "GemmInstance"
     exec_program = EXEC_TEMPLATE.render(
+        profile_with_cuda_graph=func_attrs.get("profile_with_cuda_graph", False),
         indent="  ",
         instance=instance_name_base,
         is_profiler=True,
@@ -1182,12 +1264,7 @@ def gen_profiler(
                 elem_input_type=elem_input_type,
                 elem_output_type=elem_output_type,
                 has_tma_epilogue=op_has_tma_epilogue,
-                # unified SM90a+SM100 EVT bias path (LinCombPerColBias); AIT_SM90_BIAS_SCHEDULE=1
-                # keeps the legacy SM90 bias-via-schedule (transposed) path on Hopper only.
-                evt=(
-                    Target.current()._arch == "100"
-                    or os.environ.get("AIT_SM90_BIAS_SCHEDULE", "0") != "1"
-                ),
+                evt=True,
             )
             if problem_args_template_cutlass_3x is not None
             else ""
@@ -1239,6 +1316,7 @@ def gen_profiler(
         else args_parser_template.render()
     )
     op_func = src_template.render(
+        profile_with_cuda_graph=func_attrs.get("profile_with_cuda_graph", False),
         is_profiler=True,
         instances="\n".join(instances),
         function_name=function_name,
@@ -1256,6 +1334,7 @@ def gen_profiler(
     benchmark_bdims = ["b_dim" + str(i) for i in range(ndims)]
     benchmark_cdims = ["c_dim" + str(i) for i in range(ndims)]
     func_call = FUNC_CALL_TEMPLATE.render(
+        profile_with_cuda_graph=func_attrs.get("profile_with_cuda_graph", False),
         is_profiler=True,
         func_name=function_name,
         a_ptr="memory_pool->RequestTensorByIdx(0)",
@@ -1274,6 +1353,7 @@ def gen_profiler(
         has_bias=has_bias,
     )
     code = PROFILER_TEMPLATE.render(
+        profile_with_cuda_graph=func_attrs.get("profile_with_cuda_graph", False),
         op_func=op_func,
         has_bias=has_bias,
         has_d=has_d(func_attrs),

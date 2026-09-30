@@ -29,6 +29,19 @@ class GemmProfilerBucketTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 op._extract_exec_path(DynamicProfileStrategy.MAX)
 
+    def test_backend_bucket_ratio_refines_dynamic_shapes(self):
+        op = ops.gemm_rcr()
+        op(Tensor([IntVar([81, 165888]), 192]), Tensor([384, 192]))
+        op._attrs["max_profile_bucket_ratio"] = 2.0
+        with patch.dict("os.environ", {"AIT_GEMM_M_BUCKETS": "4", "AIT_GEMM_M_BUCKET_POLICY": "log"}):
+            op._extract_exec_path(DynamicProfileStrategy.MAX)
+            keys = list(op._attrs["exec_path"])
+            self.assertEqual(keys, [f"M == {81 * 2**i} && N == 384 && K == 192" for i in range(12)])
+            for ratio in (1, 0, float("nan"), float("inf")):
+                op._attrs["max_profile_bucket_ratio"] = ratio
+                with self.assertRaises(ValueError):
+                    op._extract_exec_path(DynamicProfileStrategy.MAX)
+
     def test_partial_cache_hits_profile_every_missing_bucket(self):
         for cached in ({0}, {1}, {0, 2}, {0, 1, 2, 3}, set()):
             with self.subTest(cached=cached):

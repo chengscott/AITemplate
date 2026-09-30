@@ -45,7 +45,7 @@ constexpr int AlignC = 128 / cutlass::sizeof_bits<ElementOut>::value;  // 8
 using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
     cutlass::arch::Sm100, cutlass::arch::OpClassBlockScaledTensorOp, TileShapeMNK, ClusterShapeMNK,
     cutlass::epilogue::collective::EpilogueTileAuto, ElementAcc, ElementAcc,
-    {{'void' if source_free and not has_residual else 'ElementOut'}}, LayoutC, AlignC, ElementOut, LayoutC, AlignC,
+    ElementOut, LayoutC, AlignC, ElementOut, LayoutC, AlignC,
     cutlass::epilogue::collective::EpilogueScheduleAuto>::CollectiveOp;
 using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
     cutlass::arch::Sm100, cutlass::arch::OpClassBlockScaledTensorOp,
@@ -369,29 +369,6 @@ def gen_function(func_attrs):
                       if (func_attrs["N"], K) in measured_shapes else 0)
         tiny = ""
         tiny_call = ""
-        # FlashInfer's SM100 sweep identified multicast clusters that improve
-        # full-model latency for M<=648. Keep the established
-        # dispatch above that range: GEMM-only gains did not reliably transfer.
-        # Preserve the native quantize/RMS/SwiGLU and residual fusions.
-        # Opt-in: the full graph still regresses at some larger batches despite
-        # unchanged dispatch there. Do not enable by default from GEMM timings.
-        fi_tiles = {
-            (192, 192): (128, 64, 128, 1, 2),
-            (192, 384): (128, 64, 128, 1, 4),
-            (192, 576): (256, 64, 128, 2, 2),
-            (384, 192): (128, 64, 128, 1, 4),
-            (576, 192): (128, 64, 128, 1, 2),
-            (1152, 192): (128, 64, 128, 1, 2),
-        }
-        fi_config = fi_tiles.get((func_attrs["N"], K))
-        fi, fi_call = "", ""
-        if fi_config and os.environ.get("AIT_MXFP8_FLASHINFER", "0") == "1":
-            m, n, k, cm, cn = fi_config
-            fi = FUNC_TEMPLATE.render(**dict(
-                kwargs, func_name=name + "_fi", source_free=True,
-                max_m=min(max_m, 648), tile=f"Shape<_{m}, _{n}, _{k}>",
-                cluster=f"Shape<_{cm}, _{cn}, _1>"))
-            fi_call = f"  if (M <= 648) {{ {name}_fi({arguments}); return; }}\n"
         if tiny_limit:
             tiny = FUNC_TEMPLATE.render(**dict(kwargs, func_name=name + "_tiny",
                                                tile="Shape<_128, _64, _128>"))
@@ -399,8 +376,6 @@ def gen_function(func_attrs):
         initializers = [name + "_small", name + "_large"]
         if tiny_limit:
             initializers.insert(0, name + "_tiny")
-        if fi:
-            initializers.insert(0, name + "_fi")
         initialize_calls = "\n".join(
             f"    {variant}({arguments}, true);" for variant in initializers
         )
@@ -413,14 +388,14 @@ void {name}({signature}) {{
 {initialize_calls}
     initialized = true;
   }}
-{fi_call}{tiny_call}  if (M < 8192) {{
+{tiny_call}  if (M < 8192) {{
     {name}_small({arguments});
   }} else {{
     {name}_large({arguments});
   }}
 }}
 """
-        return fi + tiny + small + large + dispatch
+        return tiny + small + large + dispatch
     return FUNC_TEMPLATE.render(**kwargs)
 
 

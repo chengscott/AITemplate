@@ -80,7 +80,11 @@ void {{function_name}} (
     void* b_ptr,
     void* bias_ptr,
     void* c_ptr,
+{% if is_profiler and profile_with_cuda_graph %}
+    cutlass::device_memory::allocation<uint8_t>& profiler_workspace,
+{% else %}
     uint8_t* workspace,
+{% endif %}
 {% if support_split_k %}
     int split_k,
 {% endif %}

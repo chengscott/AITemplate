@@ -91,16 +91,6 @@ def gen_ops(
             cutlass_lib.extra_operation.GenerateSM80(manifest, args)
             _generate_sm90_conv3x_f16_f32acc(cutlass_lib, manifest)
             _drop_sm80_conv_ops(cutlass_lib, manifest)
-            # Opt-in validation escape hatch (NOT default): the in-progress gemm
-            # 3.x epilogue codegen currently fails to compile some TMA gemm ops
-            # (pre-existing, unrelated to conv). Setting AIT_TEMP_DROP_SM90_GEMM3X=1
-            # drops CUTLASS API 3.x gemm ops so all cutlass gemms use the (correct)
-            # SM80 path, allowing an end-to-end bench() validation of the native
-            # SM90 conv path. Off by default -> zero effect on gemm behavior.
-            import os as _os
-
-            if _os.environ.get("AIT_TEMP_DROP_SM90_GEMM3X", "0") == "1":
-                _drop_sm90_3x_gemm_ops(cutlass_lib, manifest)
         elif allow_cutlass_sm90:
             cutlass_lib.generator.GenerateSM90(manifest, args.cuda_version)
             cutlass_lib.generator.GenerateSM80(manifest, args.cuda_version)
@@ -150,7 +140,25 @@ def gen_ops(
         except AttributeError:
             _LOGGER.warning("Arch " + arch + " is not supported by extra ops.")
 
-    return _flatten_operations(manifest.operations)
+    operations = _flatten_operations(manifest.operations)
+    if (
+        arch == "90"
+        and (allow_cutlass_sm90 or force_cutlass_sm90)
+        and os.environ.get("AIT_SM90_ALLOW_SM80_GEMM", "1") != "1"
+    ):
+        # EVT stays enabled. This override only removes the older GEMM pool;
+        # shapes unsupported by native Hopper kernels may then fail to compile.
+        gemms = operations.get(cutlass_lib.library.OperationKind.Gemm, {})
+        for name, candidates in list(gemms.items()):
+            kept = [
+                op for op in candidates
+                if op.gemm_kind == cutlass_lib.library.GemmKind.Universal3x
+            ]
+            if kept:
+                gemms[name] = kept
+            else:
+                del gemms[name]
+    return operations
 
 
 def _generate_sm90_conv3x_f16_f32acc(cutlass_lib, manifest):
@@ -235,43 +243,6 @@ def _generate_sm90_conv3x_f16_f32acc(cutlass_lib, manifest):
         )
 
 
-def _drop_sm90_3x_gemm_ops(cutlass_lib, manifest):
-    """Opt-in: drop CUTLASS API 3.x (Universal3x) gemm ops, keeping SM80 gemm ops.
-
-    Only used when AIT_TEMP_DROP_SM90_GEMM3X=1 (validation escape hatch). Lets
-    the build complete on SM80 gemms while conv uses native SM90 3.x kernels.
-    """
-    library = cutlass_lib.library
-    gemm_kind = getattr(library.OperationKind, "Gemm", None)
-    if gemm_kind is None:
-        return
-    u3x = getattr(library.GemmKind, "Universal3x", None)
-
-    def _keep(ops):
-        return [op for op in ops if getattr(op, "gemm_kind", None) != u3x]
-
-    level1 = manifest.operations.get(gemm_kind)
-    if not level1:
-        return
-    values = list(level1.values())
-    is_nested = bool(values) and all(isinstance(v, dict) for v in values)
-    if is_nested:
-        for _min_cc, configs in list(level1.items()):
-            for config_name, ops in list(configs.items()):
-                kept = _keep(ops)
-                if kept:
-                    configs[config_name] = kept
-                else:
-                    del configs[config_name]
-    else:
-        for config_name, ops in list(level1.items()):
-            kept = _keep(ops)
-            if kept:
-                level1[config_name] = kept
-            else:
-                del level1[config_name]
-
-
 def _filter_sm100_conv_ops(cutlass_lib, manifest):
     """Keep the SM80 (2.x) conv pool + only the SM100 (is_3x) conv configs that compile.
 
@@ -280,9 +251,9 @@ def _filter_sm100_conv_ops(cutlass_lib, manifest):
     SM100 UMMA compile-time asserts on small convolutions, e.g. 3x3 (Invalid TileShape,
     2x1SM M/N-mode, "Stages >= 1" from auto-deduce overflowing SMEM on big tiles). We
     keep only the safe subset -- 1SM schedules whose CTA tile (inst * cluster) stays within
-    the proven-safe 128x128 SMEM envelope (see _safe_sm100_conv; AIT_SM100_CONV_NARROW=1 forces
-    the older single-CTA-only set) -- alongside the 2.x conv pool, so the profiler picks
-    native-SM100-vs-SM80 per conv shape. GEMM ops are left intact.
+    the proven-safe 128x128 SMEM envelope -- alongside the 2.x conv pool, so the profiler picks
+    among eligible tiles and clusters per conv shape. The convolution extractor
+    uses the 2.x pool for shapes without native candidates. GEMM ops are left intact.
     """
     library = cutlass_lib.library
     conv_kinds = set()
@@ -303,13 +274,10 @@ def _filter_sm100_conv_ops(cutlass_lib, manifest):
         # mode). cutlass's own procedural_name for arch>=90 already encodes tile+cluster, so
         # there is no config-name collision (an earlier FileNotFoundError was a transient
         # shared-FS makedirs race, now fixed in add_profiler, not a naming clash).
-        # AIT_SM100_CONV_NARROW=1 forces the old single-CTA-only [1,1,1] set as a fallback.
         if "2sm" in str(getattr(op, "kernel_schedule", "")).lower():
             return False
         if any(c <= 0 for c in cluster) or cluster[2] != 1:
             return False  # dynamic cluster (0 dims) needs a runtime cluster -> asserts here
-        if os.environ.get("AIT_SM100_CONV_NARROW", "0") == "1":
-            return cluster == [1, 1, 1] and inst[0] <= 128 and inst[1] <= 128
         return inst[0] * cluster[0] <= 128 and inst[1] * cluster[1] <= 128
 
     def _keep(ops):

@@ -256,23 +256,13 @@ _IDENTITY = "cutlass::epilogue::thread::Identity"
 _RELU = "cutlass::epilogue::thread::ReLu"
 
 
+# Version both profiler executables and tuning results when graph profiling changes.
+_SM90_RESIDUAL_PROFILE_NAMESPACE = "sm90_residual_evt_graph_v3"
+
+
 def _residual_evt_arches():
-    """Arches on which gemm_rcr_bias_add / _relu route through the LinCombPerColBias EVT.
-
-    SM100 (Blackwell) always: without it these residual gemms fall back to the SM80 2.x
-    kernels, and the tcgen05 EVT is up to ~2x faster on memory-bound, small-N gemms.
-
-    SM90 (Hopper) is OPT-IN via AIT_SM90_RESIDUAL_EVT=1 (default off). It builds + parity-
-    checks correctly and its SM90 3.x EVT candidates are profiled, but on memory-bound
-    small-N gemms the SM90 TMA warp-specialized kernels are not faster than SM80 (unlike
-    Blackwell tcgen05), so the profiler keeps SM80 -- off by default (no build cost),
-    available for a compute-bound regime where the SM90 3.x kernels could win.
-    """
-    import os
-
-    if os.environ.get("AIT_SM90_RESIDUAL_EVT") == "1":
-        return ("90", "100")
-    return ("100",)
+    """Always include supported Hopper and Blackwell residual EVT candidates."""
+    return ("90", "100")
 
 
 def _sm100_evt_kind(unary_op1, binary_op1, binary_op2, unary_op2):
@@ -522,7 +512,11 @@ void {{function_name}} (
     void* d1_ptr,
 {% endif %}
     void* c_ptr,
+{% if is_profiler and profile_with_cuda_graph %}
+    cutlass::device_memory::allocation<uint8_t>& profiler_workspace,
+{% else %}
     uint8_t* workspace,
+{% endif %}
 {% if support_split_k %}
     int split_k,
 {% endif %}
@@ -613,7 +607,11 @@ FUNC_CALL_TEMPLATE = jinja2.Template(
 {{indent}}    {{d1_ptr}},
 {% endif %}
 {{indent}}    {{c_ptr}},
+{% if is_profiler and profile_with_cuda_graph %}
+{{indent}}    resources.workspace,
+{% else %}
 {{indent}}    global_workspace_,
+{% endif %}
 {% if support_split_k %}
 {{indent}} {{split_k}},
 {% endif %}
@@ -854,6 +852,9 @@ def gemm_bias_broadcast_config(
     binary_op2=None,
     unary_op2=None,
 ):
+    func_attrs.pop("profile_cache_namespace", None)
+    func_attrs.pop("profile_with_cuda_graph", None)
+    func_attrs.pop("max_profile_bucket_ratio", None)
     common.make_fproc(
         func_attrs=func_attrs,
         layout=layout,
@@ -863,7 +864,7 @@ def gemm_bias_broadcast_config(
         return
     # Route the single-residual add / add_relu configs through the EVT LinCombPerColBias[EltAct]
     # functor (non-transposed); drop every other config's 3.x ops to the SM80 fallback.
-    # Always on for SM100; opt-in for SM90 (AIT_SM90_RESIDUAL_EVT) -- see _residual_evt_arches.
+    # Supported residual EVT candidates are enabled on SM90 and SM100.
     from aitemplate.backend.cuda.gemm_universal import (
         common_bias_activation,
         gemm_rcr_bias,
@@ -908,6 +909,11 @@ def gemm_bias_broadcast_config(
             # fusion needs an explicit TmaWarpSpecialized epilogue. Keep the op's own
             # warp-specialized mainloop schedule (pingpong/cooperative) from the generator.
             op.epilogue_schedule = lib.EpilogueScheduleType.TmaWarpSpecialized
+            # Rank candidates under graph replay with reused buffers. Cold-buffer
+            # timings favor TMA too early for small, cache-resident residual GEMMs.
+            func_attrs["profile_cache_namespace"] = _SM90_RESIDUAL_PROFILE_NAMESPACE
+            func_attrs["profile_with_cuda_graph"] = True
+            func_attrs["max_profile_bucket_ratio"] = 2.0
         kwargs = dict(
             element_output=lib.DataTypeTag[op.D.element],
             element_compute=lib.DataTypeTag[op.element_epilogue],
@@ -1010,6 +1016,7 @@ def gen_profiler(
 
     instance_name_base = "GemmInstance"
     exec_program = common.EXEC_TEMPLATE.render(
+        profile_with_cuda_graph=func_attrs.get("profile_with_cuda_graph", False),
         indent="  ",
         instance=instance_name_base,
         is_profiler=True,
@@ -1083,6 +1090,7 @@ def gen_profiler(
         instances.append(instance)
         benchmark_instances.append(benchmark_instance)
     op_func = SRC_TEMPLATE.render(
+        profile_with_cuda_graph=func_attrs.get("profile_with_cuda_graph", False),
         is_profiler=True,
         instances="\n".join(instances),
         function_name=function_name,
@@ -1103,6 +1111,7 @@ def gen_profiler(
     benchmark_bdims = ["b_dim" + str(i) for i in range(ndims)]
     benchmark_cdims = ["c_dim" + str(i) for i in range(ndims)]
     func_call = FUNC_CALL_TEMPLATE.render(
+        profile_with_cuda_graph=func_attrs.get("profile_with_cuda_graph", False),
         is_profiler=True,
         func_name="gemm",
         a_ptr="memory_pool->RequestTensorByIdx(0)",
@@ -1119,6 +1128,7 @@ def gen_profiler(
         has_d1=has_d1,
     )
     code = common.PROFILER_TEMPLATE.render(
+        profile_with_cuda_graph=func_attrs.get("profile_with_cuda_graph", False),
         op_func=op_func,
         has_bias=True,
         has_d=True,

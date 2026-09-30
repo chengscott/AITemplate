@@ -19,7 +19,6 @@ where A[RowMajor][M, K], B[ColMajor][N, K], bias[RowMajor][N]
 """
 
 import copy
-import os
 
 import jinja2
 from aitemplate.backend import registry
@@ -284,14 +283,8 @@ PROFILER_PROBLEM_ARGS_TEMPLATE_CUTLASS_3X = jinja2.Template(
 
 
 def bias_use_evt():
-    """Fuse the CUTLASS 3.x TMA-epilogue bias through the EVT functor (LinCombPerColBias),
-    unified across SM90a and SM100. SM100 has no BiasElementwise schedule so it MUST use
-    EVT; SM90 also uses EVT by default (one mechanism, non-transposed problem). Set
-    AIT_SM90_BIAS_SCHEDULE=1 to fall back to the legacy SM90 bias-via-schedule path
-    (transposed problem) -- ignored on SM100 (no such schedule exists there)."""
-    if Target.current()._arch == "100":
-        return True
-    return os.environ.get("AIT_SM90_BIAS_SCHEDULE", "0") != "1"
+    """Use EVT bias fusion for native Hopper and Blackwell GEMMs."""
+    return True
 
 
 @registry.reg("cuda.gemm_rcr_bias.config")
